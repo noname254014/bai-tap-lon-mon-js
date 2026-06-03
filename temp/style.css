@@ -361,7 +361,6 @@ mask-image: linear-gradient(to bottom, rgba(0,0,0,1) 50%, rgba(0,0,0,1) 60%);
     z-index: 2;
     position: absolute;
     width: 100%; 
-     
     overflow: hidden;
   }
   .starWrap{
@@ -547,7 +546,7 @@ mask-image: linear-gradient(to bottom, rgba(0,0,0,1) 50%, rgba(0,0,0,1) 60%);
     z-index: 5;
     animation-name: focus;
   }
-   @keyframes focus{ 
+  @keyframes focus{ 
     0% { filter: blur(5px);}
     16% {filter: blur(2px);}
     20% {filter: blur(0px);}
