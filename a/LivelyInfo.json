@@ -1,0 +1,14 @@
+{
+  "AppVersion": "0.8.5.0",
+  "Title": "Landscape",
+  "Thumbnail": "lively_t.jpg",
+  "Preview": "lively_p.gif",
+  "Desc": "Web animation.",
+  "Author": "Louis Coyle",
+  "License": null,
+  "Contact": "https://codepen.io/dropside/full/MYGKyj",
+  "Type": 1,
+  "FileName": "index.html",
+  "Arguments": null,
+  "IsAbsolutePath": false
+}
