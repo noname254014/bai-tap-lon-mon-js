@@ -238,6 +238,64 @@ const APP_STYLES = {
 // Utility & configuration helpers
 // -------------------------------------------------------------------------
 
+// Pure function for LOOK/SCAN target floor sorting - extracted for testability
+function sortTargetFloorsPure(elevator) {
+    if (!elevator || elevator.targetFloors.length === 0) return elevator.targetFloors;
+
+    const pos = elevator.position;
+    const dir = elevator.direction === 'none' ? 'up' : elevator.direction;
+    const targets = [...new Set(elevator.targetFloors)];
+
+    targets.sort((a, b) => {
+        if (dir === 'up') return a - b;
+        if (dir === 'down') return b - a;
+        const da = Math.abs(a - pos);
+        const db = Math.abs(b - pos);
+        if (da !== db) return da - db;
+        return a - b;
+    });
+
+    if (dir === 'up') {
+        const below = targets.filter(f => f < pos).sort((a, b) => b - a);
+        const above = targets.filter(f => f >= pos).sort((a, b) => a - b);
+        return [...above, ...below];
+    } else {
+        const above = targets.filter(f => f > pos).sort((a, b) => a - b);
+        const below = targets.filter(f => f <= pos).sort((a, b) => b - a);
+        return [...below, ...above];
+    }
+}
+
+// Pure function for dispatch cost calculation - extracted for testability
+function calculateDispatchCostPure(elevator, floor, direction, config) {
+    const dist = Math.abs(elevator.position - floor);
+    let cost = dist * 2;
+
+    if (elevator.direction !== 'none' && elevator.direction !== direction) {
+        cost += WRONG_DIRECTION_PENALTY;
+        if (elevator.direction === 'up' && floor < elevator.position) cost += 4;
+        if (elevator.direction === 'down' && floor > elevator.position) cost += 4;
+    }
+
+    const loadRatio = elevator.currentLoad / config.maxLoad;
+    if (loadRatio > 0.85) cost += OVERLOAD_PENALTY * loadRatio;
+    if (loadRatio > 1.0) cost += 50;
+
+    if (elevator.direction === direction) {
+        if (direction === 'up' && floor >= elevator.position) cost -= SAME_DIRECTION_BONUS;
+        if (direction === 'down' && floor <= elevator.position) cost -= SAME_DIRECTION_BONUS;
+    }
+
+    if (elevator.status === ELEVATOR_STATUS.FAULT) cost += 100;
+    if (elevator.doorState !== DOOR_STATE.CLOSED) cost += 2;
+    if (elevator.targetFloors.includes(floor)) cost -= 5;
+
+    const idleBonus = elevator.status === ELEVATOR_STATUS.IDLE ? -2 : 0;
+    cost += idleBonus;
+
+    return cost;
+}
+
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
@@ -520,29 +578,7 @@ export function initElevatorSimulation(contentElement) {
     function sortTargetFloors(elevatorId) {
         const elevator = systemState.elevators[elevatorId];
         if (!elevator || elevator.targetFloors.length === 0) return;
-
-        const pos = elevator.position;
-        const dir = elevator.direction === 'none' ? 'up' : elevator.direction;
-        const targets = [...new Set(elevator.targetFloors)];
-
-        targets.sort((a, b) => {
-            if (dir === 'up') return a - b;
-            if (dir === 'down') return b - a;
-            const da = Math.abs(a - pos);
-            const db = Math.abs(b - pos);
-            if (da !== db) return da - db;
-            return a - b;
-        });
-
-        if (dir === 'up') {
-            const below = targets.filter(f => f < pos).sort((a, b) => b - a);
-            const above = targets.filter(f => f >= pos).sort((a, b) => a - b);
-            elevator.targetFloors = [...above, ...below];
-        } else {
-            const above = targets.filter(f => f > pos).sort((a, b) => a - b);
-            const below = targets.filter(f => f <= pos).sort((a, b) => b - a);
-            elevator.targetFloors = [...below, ...above];
-        }
+        elevator.targetFloors = sortTargetFloorsPure(elevator);
     }
 
     function detectEmergency(elevatorId, deltaMs = 16) {
@@ -983,7 +1019,7 @@ export function initElevatorSimulation(contentElement) {
         const waited = passenger.boardTime ? ((passenger.boardTime - passenger.waitStartTime) / 1000).toFixed(1) : '—';
         const riding = passenger.boardTime ? ((performance.now() - passenger.boardTime) / 1000).toFixed(1) : '—';
         tooltip.innerHTML = `ID: #${passenger.id}<br>From: Floor ${passenger.originFloor}<br>To: Floor ${passenger.destinationFloor}<br>Waited: ${waited}s<br>Riding: ${riding}s`;
-        tooltip.style.cssText = 'position:absolute;background:#1a1a26;color:#e8eaed;border:1px solid #3a3a4a;border-radius:6px;font-size:11px;padding:8px 10px;z-index:999;white-space:nowrap;';
+        tooltip.style.cssText = 'position:fixed;background:#1a1a26;color:#e8eaed;border:1px solid #3a3a4a;border-radius:6px;font-size:11px;padding:8px 10px;z-index:999;white-space:nowrap;';
         tooltip.style.left = `${rect.left}px`;
         tooltip.style.top = `${rect.top - 80}px`;
         document.body.appendChild(tooltip);
@@ -1027,19 +1063,35 @@ export function initElevatorSimulation(contentElement) {
         updateCabinDots(elevatorId);
     }
 
+    const cabinDotCounts = new Map();
+
     function updateCabinDots(elevatorId) {
         const cabin = dom.cabinElements[elevatorId];
         const elevator = systemState.elevators[elevatorId];
         if (!cabin || !elevator) return;
         const dots = cabin.querySelector('[data-dots]');
         if (!dots) return;
+
+        const currentCount = elevator.passengers.length;
+        const prevCount = cabinDotCounts.get(elevatorId) || 0;
+
+        if (currentCount === prevCount) return;
+
         dots.innerHTML = '';
-        const maxDots = Math.min(elevator.passengers.length, 12);
+        const maxDots = Math.min(currentCount, 12);
         for (let i = 0; i < maxDots; i++) {
             const dot = document.createElement('span');
-            dot.style.cssText = `width:${PASSENGER_DOT_SIZE}px;height:${PASSENGER_DOT_SIZE}px;border-radius:50%;background:#4ade80;display:inline-block;`;
+            dot.style.cssText = `width:${PASSENGER_DOT_SIZE}px;height:${PASSENGER_DOT_SIZE}px;border-radius:50%;background:#4ade80;display:inline-block;cursor:pointer;`;
+            const passenger = elevator.passengers[i];
+            if (passenger) {
+                dot.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    showPassengerTooltip(dot, passenger);
+                });
+            }
             dots.appendChild(dot);
         }
+        cabinDotCounts.set(elevatorId, currentCount);
     }
 
     function updateFaultBlink(elevatorId) {
@@ -2530,78 +2582,24 @@ function runConfigSelfTest(config) {
     results.push({ name: 'timeToTop', pass: t > 0, detail: `t=${t.toFixed(2)}s` });
 
     // Test: dispatcherSelectsNearest
-    const testState = createSystemState({ totalFloors: 20, elevatorCount: 3, maxLoad: 800, maxAcceleration: 1.0, maxVelocity: 2.5, doorOpenTime: 2000, doorCloseTime: 1500, spawnRate: 3000, simSpeed: 1, enableZoning: false });
+    const testConfig = { totalFloors: 20, elevatorCount: 3, maxLoad: 800, maxAcceleration: 1.0, maxVelocity: 2.5, doorOpenTime: 2000, doorCloseTime: 1500, spawnRate: 3000, simSpeed: 1, enableZoning: false };
+    const testState = createSystemState(testConfig);
     testState.elevators[0].position = 0;
     testState.elevators[1].position = 10;
     testState.elevators[2].position = 19;
-    const costs = testState.elevators.map(e => ({ id: e.id, cost: calculateDispatchCost(e, 9, 'up') }));
+    const costs = testState.elevators.map(e => ({ id: e.id, cost: calculateDispatchCostPure(e, 9, 'up', testConfig) }));
     const best = costs.reduce((min, c) => c.cost < min.cost ? c : min);
     results.push({ name: 'dispatcherSelectsNearest', pass: best.id === 1, detail: `best=${best.id} (pos=${testState.elevators[best.id].position})` });
 
     // Test: sortTargetFloorsLookUp
     const testElevUp = { position: 5, direction: 'up', targetFloors: [2, 8, 14, 3, 11] };
-    const tempStateUp = createSystemState(config);
-    tempStateUp.elevators[0] = testElevUp;
-    const originalSort = sortTargetFloors;
-    sortTargetFloors = (id) => {
-        const e = tempStateUp.elevators[id];
-        if (!e || e.targetFloors.length === 0) return;
-        const pos = e.position;
-        const dir = e.direction === 'none' ? 'up' : e.direction;
-        const targets = [...new Set(e.targetFloors)];
-        targets.sort((a, b) => {
-            if (dir === 'up') return a - b;
-            if (dir === 'down') return b - a;
-            const da = Math.abs(a - pos);
-            const db = Math.abs(b - pos);
-            if (da !== db) return da - db;
-            return a - b;
-        });
-        if (dir === 'up') {
-            const below = targets.filter(f => f < pos).sort((a, b) => b - a);
-            const above = targets.filter(f => f >= pos).sort((a, b) => a - b);
-            e.targetFloors = [...above, ...below];
-        } else {
-            const above = targets.filter(f => f > pos).sort((a, b) => a - b);
-            const below = targets.filter(f => f <= pos).sort((a, b) => b - a);
-            e.targetFloors = [...below, ...above];
-        }
-    };
-    sortTargetFloors(0);
-    results.push({ name: 'sortTargetFloorsLookUp', pass: JSON.stringify(testElevUp.targetFloors) === '[8,11,14,3,2]', detail: `result=[${testElevUp.targetFloors}]` });
-    sortTargetFloors = originalSort;
+    const sortedUp = sortTargetFloorsPure(testElevUp);
+    results.push({ name: 'sortTargetFloorsLookUp', pass: JSON.stringify(sortedUp) === '[8,11,14,3,2]', detail: `result=[${sortedUp}]` });
 
     // Test: sortTargetFloorsLookDown
     const testElevDown = { position: 10, direction: 'down', targetFloors: [2, 15, 7, 12, 4] };
-    const tempStateDown = createSystemState(config);
-    tempStateDown.elevators[0] = testElevDown;
-    sortTargetFloors = (id) => {
-        const e = tempStateDown.elevators[id];
-        if (!e || e.targetFloors.length === 0) return;
-        const pos = e.position;
-        const dir = e.direction === 'none' ? 'up' : e.direction;
-        const targets = [...new Set(e.targetFloors)];
-        targets.sort((a, b) => {
-            if (dir === 'up') return a - b;
-            if (dir === 'down') return b - a;
-            const da = Math.abs(a - pos);
-            const db = Math.abs(b - pos);
-            if (da !== db) return da - db;
-            return a - b;
-        });
-        if (dir === 'up') {
-            const below = targets.filter(f => f < pos).sort((a, b) => b - a);
-            const above = targets.filter(f => f >= pos).sort((a, b) => a - b);
-            e.targetFloors = [...above, ...below];
-        } else {
-            const above = targets.filter(f => f > pos).sort((a, b) => a - b);
-            const below = targets.filter(f => f <= pos).sort((a, b) => b - a);
-            e.targetFloors = [...below, ...above];
-        }
-    };
-    sortTargetFloors(0);
-    results.push({ name: 'sortTargetFloorsLookDown', pass: testElevDown.targetFloors[0] <= 10 && testElevDown.targetFloors[testElevDown.targetFloors.length - 1] > 10, detail: `result=[${testElevDown.targetFloors}]` });
-    sortTargetFloors = originalSort;
+    const sortedDown = sortTargetFloorsPure(testElevDown);
+    results.push({ name: 'sortTargetFloorsLookDown', pass: sortedDown[0] <= 10 && sortedDown[sortedDown.length - 1] > 10, detail: `result=[${sortedDown}]` });
 
     return results;
 }
