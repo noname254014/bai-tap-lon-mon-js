@@ -61,7 +61,21 @@ function getDefaultSimConfig() {
         doorOpenTime: 2000,
         doorCloseTime: 1500,
         spawnRate: 3000,
-        simSpeed: 1
+        simSpeed: 1,
+        enableZoning: false
+    };
+}
+
+// Responsive UI - debounce function
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
     };
 }
 
@@ -322,7 +336,8 @@ function createElevator(id, config, startFloor = 0) {
         phase: ELEVATOR_PHASE.IDLE,
         _doorPhase: null,
         _lastPosition: startFloor,
-        _floorStopHandled: startFloor
+        _floorStopHandled: startFloor,
+        idleTimer: 0
     };
 }
 
@@ -369,6 +384,9 @@ export function initElevatorSimulation(contentElement) {
     let statsIntervalId = null;
     let lastFrameTime = 0;
     let configLoaded = false;
+    let lastKnownWidth = contentElement.offsetWidth;
+    let lastBuiltFloors = simConfig.totalFloors;
+    let lastBuiltElevatorCount = simConfig.elevatorCount;
     const eventLog = new SimulationEventLog();
     let elevatorDetailContainer = null;
     let eventLogContainer = null;
@@ -390,7 +408,8 @@ export function initElevatorSimulation(contentElement) {
         waitBadges: [],
         floorIndicators: [],
         callButtons: { up: [], down: [] },
-        speedButtons: []
+        speedButtons: [],
+        floorRows: []
     };
 
     function getAnime() {
@@ -427,6 +446,16 @@ export function initElevatorSimulation(contentElement) {
     function calculateDispatchCost(elevator, floor, direction) {
         const dist = Math.abs(elevator.position - floor);
         let cost = dist * 2;
+
+        // Zoning algorithm - add penalty if floor is outside elevator's zone
+        if (simConfig.enableZoning) {
+            const zoneSize = Math.ceil(simConfig.totalFloors / simConfig.elevatorCount);
+            const zoneMin = elevator.id * zoneSize;
+            const zoneMax = zoneMin + zoneSize - 1;
+            if (floor < zoneMin || floor > zoneMax) {
+                cost += 30;
+            }
+        }
 
         if (elevator.direction !== 'none' && elevator.direction !== direction) {
             cost += WRONG_DIRECTION_PENALTY;
@@ -528,6 +557,7 @@ export function initElevatorSimulation(contentElement) {
             elevator.acceleration = 0;
             eventLog.push('FAULT', `Thang ${elevatorId + 1} quá tải ${Math.round(elevator.currentLoad)}kg`);
             if (eventLogContainer) eventLog.render(eventLogContainer);
+            renderFaultButtons();
             return true;
         }
 
@@ -540,6 +570,7 @@ export function initElevatorSimulation(contentElement) {
                 elevator.status = ELEVATOR_STATUS.FAULT;
                 eventLog.push('FAULT', `Thang ${elevatorId + 1} kẹt > ${STUCK_THRESHOLD_MS / 1000}s`);
                 if (eventLogContainer) eventLog.render(eventLogContainer);
+                renderFaultButtons();
                 return true;
             }
         } else if (!nearStop || elevator.doorState !== DOOR_STATE.CLOSED) {
@@ -791,6 +822,35 @@ export function initElevatorSimulation(contentElement) {
             } else {
                 updateDoorSequence(elevator, deltaTimeMs * simConfig.simSpeed);
             }
+
+            // Pre-positioning when idle
+            if (elevator.status === ELEVATOR_STATUS.IDLE && elevator.targetFloors.length === 0) {
+                elevator.idleTimer += deltaTimeMs;
+                if (elevator.idleTimer >= 3000) {
+                    let maxDepth = 0;
+                    let busiestFloor = -1;
+                    for (let f = 0; f < simConfig.totalFloors; f++) {
+                        const q = systemState.floorQueues[f];
+                        const depth = q.up.length + q.down.length;
+                        if (depth > maxDepth) {
+                            maxDepth = depth;
+                            busiestFloor = f;
+                        }
+                    }
+                    if (busiestFloor >= 0 && maxDepth > 0 && Math.round(elevator.position) !== busiestFloor) {
+                        elevator.targetFloors.push(busiestFloor);
+                        elevator.direction = busiestFloor > elevator.position ? 'up' : 'down';
+                        elevator.status = ELEVATOR_STATUS.MOVING;
+                        elevator.phase = ELEVATOR_PHASE.ACCELERATING;
+                        elevator.idleTimer = 0;
+                        eventLog.push('PRE-POS', `Thang ${elevator.id + 1} tự di chuyển đến tầng ${busiestFloor} (depth ${maxDepth})`);
+                        if (eventLogContainer) eventLog.render(eventLogContainer);
+                    }
+                }
+            } else {
+                elevator.idleTimer = 0;
+            }
+
             systemState.stats.loadPerElevator[elevator.id] = Math.round(elevator.currentLoad);
         }
 
@@ -818,7 +878,7 @@ export function initElevatorSimulation(contentElement) {
             dest = picked.dest;
         }
         const direction = floorToDirection(origin, dest);
-        const weight = gaussianRandom(72, 12, 45, 100);
+        const weight = gaussianRandom(75, 15, 50, 130);
         const passenger = {
             id: passengerIdCounter++,
             originFloor: origin,
@@ -913,13 +973,41 @@ export function initElevatorSimulation(contentElement) {
         anime.set(cabin, { translateY: y });
     }
 
+    function showPassengerTooltip(anchorEl, passenger) {
+        const existing = document.getElementById('passenger-tooltip');
+        if (existing) existing.remove();
+
+        const tooltip = document.createElement('div');
+        tooltip.id = 'passenger-tooltip';
+        const rect = anchorEl.getBoundingClientRect();
+        const waited = passenger.boardTime ? ((passenger.boardTime - passenger.waitStartTime) / 1000).toFixed(1) : '—';
+        const riding = passenger.boardTime ? ((performance.now() - passenger.boardTime) / 1000).toFixed(1) : '—';
+        tooltip.innerHTML = `ID: #${passenger.id}<br>From: Floor ${passenger.originFloor}<br>To: Floor ${passenger.destinationFloor}<br>Waited: ${waited}s<br>Riding: ${riding}s`;
+        tooltip.style.cssText = 'position:absolute;background:#1a1a26;color:#e8eaed;border:1px solid #3a3a4a;border-radius:6px;font-size:11px;padding:8px 10px;z-index:999;white-space:nowrap;';
+        tooltip.style.left = `${rect.left}px`;
+        tooltip.style.top = `${rect.top - 80}px`;
+        document.body.appendChild(tooltip);
+
+        const dismiss = (e) => {
+            if (!tooltip.contains(e.target)) {
+                tooltip.remove();
+                document.removeEventListener('click', dismiss);
+            }
+        };
+        setTimeout(() => document.addEventListener('click', dismiss), 0);
+    }
+
     function animatePassengerDotEnter(elevatorId, passenger) {
         const cabin = dom.cabinElements[elevatorId];
         if (!cabin) return;
         const dots = cabin.querySelector('[data-dots]');
         if (!dots) return;
         const dot = document.createElement('span');
-        dot.style.cssText = `width:${PASSENGER_DOT_SIZE}px;height:${PASSENGER_DOT_SIZE}px;border-radius:50%;background:#4ade80;display:inline-block;opacity:0;`;
+        dot.style.cssText = `width:${PASSENGER_DOT_SIZE}px;height:${PASSENGER_DOT_SIZE}px;border-radius:50%;background:#4ade80;display:inline-block;opacity:0;cursor:pointer;`;
+        dot.addEventListener('click', (e) => {
+            e.stopPropagation();
+            showPassengerTooltip(dot, passenger);
+        });
         dots.appendChild(dot);
         const anime = getAnime();
         if (anime) {
@@ -932,6 +1020,7 @@ export function initElevatorSimulation(contentElement) {
             });
         }
         updateCabinDots(elevatorId);
+        // Note: updateCabinDots rebuilds dots from scratch, so click listeners will be re-attached on next enter event
     }
 
     function animatePassengerDotExit(elevatorId, passenger) {
@@ -977,6 +1066,11 @@ export function initElevatorSimulation(contentElement) {
             if (header) {
                 header.textContent = `F${Math.round(systemState.elevators[i].position)}`;
             }
+            const dirEl = dom.cabinElements[i]?.querySelector('[data-dir-ind]');
+            if (dirEl) {
+                const e = systemState.elevators[i];
+                dirEl.textContent = e.direction === 'up' ? '▲' : e.direction === 'down' ? '▼' : '●';
+            }
             const loadEl = dom.cabinElements[i]?.querySelector('[data-load-ind]');
             if (loadEl) {
                 const e = systemState.elevators[i];
@@ -999,7 +1093,26 @@ export function initElevatorSimulation(contentElement) {
             }
         }
 
+        // Heat map floor - color floor rows based on queue depth
         const anime = getAnime();
+        for (let f = 0; f < simConfig.totalFloors; f++) {
+            const q = systemState.floorQueues[f];
+            const depth = q.up.length + q.down.length;
+            const row = dom.floorRows[f];
+            if (!row) continue;
+            let bgColor = 'transparent';
+            if (depth >= 1 && depth <= 3) {
+                bgColor = 'rgba(245, 158, 11, 0.15)';
+            } else if (depth >= 4) {
+                bgColor = 'rgba(239, 68, 68, 0.15)';
+            }
+            if (anime) {
+                anime.set(row, { backgroundColor: bgColor });
+            } else {
+                row.style.backgroundColor = bgColor;
+            }
+        }
+
         if (anime) {
             dom.cabinElements.forEach((cabin, i) => {
                 if (cabin?.dataset.fault === '1') {
@@ -1104,6 +1217,9 @@ export function initElevatorSimulation(contentElement) {
             card.style.cssText = 'padding:8px;margin:6px 12px;background:#1a1a26;border-radius:6px;border:1px solid #2a2a38;font-size:10px;line-height:1.6;';
             const targets = e.targetFloors.length ? e.targetFloors.join(',') : '—';
             const decel = computeDecelerationDistance(Math.abs(e.velocity), simConfig.maxAcceleration).toFixed(2);
+            const distToNextTarget = e.targetFloors.length > 0 ? Math.abs(e.targetFloors[0] - e.position) : 0;
+            const eta = distToNextTarget > 0 ? computeTimeToReach(distToNextTarget, simConfig.maxVelocity, simConfig.maxAcceleration) : 0;
+            const etaDisplay = eta > 0 ? `ETA: ~${eta.toFixed(1)}s` : 'ETA: —';
             card.innerHTML = `
                 <div style="font-weight:700;color:#7eb8ff;margin-bottom:4px">Thang ${e.id + 1}</div>
                 <div>Tầng: <b>${e.position.toFixed(2)}</b> | v=${e.velocity.toFixed(2)} | a=${e.acceleration.toFixed(2)}</div>
@@ -1111,6 +1227,7 @@ export function initElevatorSimulation(contentElement) {
                 <div>Cửa: ${describeDoorState(e.doorState)} | Lỗi: ${describeFault(e.faultStatus)}</div>
                 <div>Tải: ${Math.round(e.currentLoad)}/${simConfig.maxLoad}kg | HK: ${e.passengers.length}</div>
                 <div>Đích LOOK: [${targets}]</div>
+                <div>${etaDisplay}</div>
                 <div>Dừng khẩn ~${decel} tầng</div>`;
             elevatorDetailContainer.appendChild(card);
         }
@@ -1391,11 +1508,63 @@ export function initElevatorSimulation(contentElement) {
         ctrlSection.appendChild(btnSave);
 
         panel.appendChild(ctrlSection);
+
+        // Zoning toggle section
+        const zoningSection = document.createElement('div');
+        Object.assign(zoningSection.style, APP_STYLES.panelSection);
+        const zoningTitle = document.createElement('div');
+        Object.assign(zoningTitle.style, APP_STYLES.sectionTitle);
+        zoningTitle.textContent = 'Thuật toán Zoning';
+        zoningSection.appendChild(zoningTitle);
+
+        const zoningToggleRow = document.createElement('div');
+        zoningToggleRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-top:8px;';
+        const zoningLabel = document.createElement('span');
+        zoningLabel.style.cssText = 'font-size:12px;color:#b0b8c4;';
+        zoningLabel.textContent = 'Enable Zoning';
+        const zoningToggle = document.createElement('input');
+        zoningToggle.type = 'checkbox';
+        zoningToggle.checked = simConfig.enableZoning;
+        zoningToggle.style.cssText = 'width:16px;height:16px;cursor:pointer;';
+        zoningToggle.addEventListener('change', () => {
+            simConfig.enableZoning = zoningToggle.checked;
+            eventLog.push('CONFIG', `Zoning: ${simConfig.enableZoning ? 'ON' : 'OFF'}`);
+            if (eventLogContainer) eventLog.render(eventLogContainer);
+            setStatusMessage(`Zoning ${simConfig.enableZoning ? 'đã bật' : 'đã tắt'}.`);
+        });
+        zoningToggleRow.appendChild(zoningLabel);
+        zoningToggleRow.appendChild(zoningToggle);
+        zoningSection.appendChild(zoningToggleRow);
+
+        const zoningInfo = document.createElement('div');
+        zoningInfo.style.cssText = 'font-size:10px;color:#6b7280;margin-top:6px;line-height:1.4;';
+        zoningInfo.textContent = 'Khi bật: mỗi thang phục vụ một vùng tầng cụ thể. Thang sẽ bị phạt +30 nếu tầng yêu cầu nằm ngoài vùng của nó.';
+        zoningSection.appendChild(zoningInfo);
+
+        panel.appendChild(zoningSection);
+
+        // Fault Management section
+        const faultSection = document.createElement('div');
+        Object.assign(faultSection.style, APP_STYLES.panelSection);
+        const faultTitle = document.createElement('div');
+        Object.assign(faultTitle.style, APP_STYLES.sectionTitle);
+        faultTitle.textContent = 'Fault Management';
+        faultSection.appendChild(faultTitle);
+
+        const faultButtonsContainer = document.createElement('div');
+        faultButtonsContainer.id = 'fault-buttons-container';
+        faultButtonsContainer.dataset.faultContainer = '1';
+        faultButtonsContainer.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
+        faultSection.appendChild(faultButtonsContainer);
+
+        panel.appendChild(faultSection);
+        dom.faultButtonsContainer = faultButtonsContainer;
         buildPresetSection(panel);
         buildAlgorithmInfoPanel(panel);
         buildEventLogPanel(panel);
         container.appendChild(panel);
         updateSpeedButtonStyles();
+        renderFaultButtons();
     }
 
     function updateSpeedButtonStyles() {
@@ -1471,10 +1640,15 @@ export function initElevatorSimulation(contentElement) {
             const floorInd = document.createElement('span');
             floorInd.dataset.floorInd = '1';
             floorInd.textContent = 'F0';
+            const dirInd = document.createElement('span');
+            dirInd.dataset.dirInd = '1';
+            dirInd.textContent = '●';
+            dirInd.style.marginLeft = '4px';
             const loadInd = document.createElement('span');
             loadInd.dataset.loadInd = '1';
             loadInd.textContent = `0/${simConfig.maxLoad}kg`;
             cabinHeader.appendChild(floorInd);
+            cabinHeader.appendChild(dirInd);
             cabinHeader.appendChild(loadInd);
 
             const doorContainer = document.createElement('div');
@@ -1517,6 +1691,7 @@ export function initElevatorSimulation(contentElement) {
         for (let f = simConfig.totalFloors - 1; f >= 0; f--) {
             const row = document.createElement('div');
             Object.assign(row.style, APP_STYLES.floorRow);
+            dom.floorRows[f] = row;
 
             const num = document.createElement('div');
             Object.assign(num.style, APP_STYLES.floorNum);
@@ -1572,7 +1747,7 @@ export function initElevatorSimulation(contentElement) {
             ? Math.min(simConfig.totalFloors - 1, floor + 1 + Math.floor(Math.random() * (simConfig.totalFloors - floor - 1)))
             : Math.max(0, Math.floor(Math.random() * floor));
         if (dest === floor) dest = direction === 'up' ? floor + 1 : floor - 1;
-        const weight = gaussianRandom(72, 12, 45, 100);
+        const weight = gaussianRandom(75, 15, 50, 130);
         const passenger = {
             id: passengerIdCounter++,
             originFloor: floor,
@@ -1665,6 +1840,49 @@ export function initElevatorSimulation(contentElement) {
         refreshSliderDisplays();
         updateStatsDisplay();
         setStatusMessage('Đã khởi tạo lại mô phỏng.');
+    }
+
+    function reinitElevator(elevatorId) {
+        const elevator = systemState.elevators[elevatorId];
+        if (!elevator) return;
+        elevator.faultStatus = FAULT_TYPE.NONE;
+        elevator.status = ELEVATOR_STATUS.IDLE;
+        elevator.velocity = 0;
+        elevator.acceleration = 0;
+        elevator.direction = 'none';
+        elevator.phase = ELEVATOR_PHASE.IDLE;
+        elevator.targetFloors = [];
+        eventLog.push('FAULT', `Thang ${elevatorId + 1} đã được reset thủ công.`);
+        if (eventLogContainer) eventLog.render(eventLogContainer);
+        updateFaultBlink(elevatorId);
+        renderFaultButtons();
+        setStatusMessage(`Đã reset thang ${elevatorId + 1}.`);
+    }
+
+    function renderFaultButtons() {
+        // Guard: if faultButtonsContainer is null or detached from document, re-query it
+        // The control panel survives rebuilds (only center column is rebuilt), but the ref must be validated
+        if (!dom.faultButtonsContainer || !document.contains(dom.faultButtonsContainer)) {
+            const queried = dom.root?.querySelector('[data-fault-container]');
+            if (queried) dom.faultButtonsContainer = queried;
+            else return;
+        }
+        dom.faultButtonsContainer.innerHTML = '';
+        for (const elev of systemState.elevators) {
+            if (elev.faultStatus !== FAULT_TYPE.NONE) {
+                const btn = document.createElement('button');
+                btn.textContent = `Reset T${elev.id + 1} (${describeFault(elev.faultStatus)})`;
+                btn.style.cssText = 'padding:6px 10px;background:#dc2626;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;';
+                btn.addEventListener('click', () => reinitElevator(elev.id));
+                dom.faultButtonsContainer.appendChild(btn);
+            }
+        }
+        if (dom.faultButtonsContainer.children.length === 0) {
+            const empty = document.createElement('div');
+            empty.style.cssText = 'font-size:10px;color:#555;padding:4px 0;';
+            empty.textContent = '(Không có lỗi)';
+            dom.faultButtonsContainer.appendChild(empty);
+        }
     }
 
     function rebuildSimulationView() {
@@ -1797,6 +2015,9 @@ export function initElevatorSimulation(contentElement) {
         if (anime) {
             dom.cabinElements.forEach(el => el && anime.remove(el));
         }
+        if (typeof resizeHandler !== 'undefined') {
+            window.removeEventListener('resize', resizeHandler);
+        }
     }
 
     // =====================================================================
@@ -1835,6 +2056,33 @@ export function initElevatorSimulation(contentElement) {
     root.appendChild(statusMsg);
 
     contentElement.appendChild(root);
+
+    // Responsive UI - window resize listener with debounce
+    let resizeHandler = debounce(() => {
+        const newWidth = contentElement.offsetWidth;
+        if (Math.abs(newWidth - lastKnownWidth) < 50) {
+            return;
+        }
+        lastKnownWidth = newWidth;
+
+        if (newWidth < 900) {
+            const statsPanel = dom.root.querySelector('[data-stats-panel]');
+            if (statsPanel) statsPanel.style.display = 'none';
+            if (dom.controlPanel) dom.controlPanel.style.width = '220px';
+        } else {
+            const statsPanel = dom.root.querySelector('[data-stats-panel]');
+            if (statsPanel) statsPanel.style.display = 'flex';
+            if (dom.controlPanel) dom.controlPanel.style.width = '320px';
+        }
+
+        // Only rebuild if config actually changed (floors or elevator count)
+        if (simConfig.totalFloors !== lastBuiltFloors || simConfig.elevatorCount !== lastBuiltElevatorCount) {
+            lastBuiltFloors = simConfig.totalFloors;
+            lastBuiltElevatorCount = simConfig.elevatorCount;
+            rebuildSimulationView();
+        }
+    }, 200);
+    window.addEventListener('resize', resizeHandler);
 
     const observer = new MutationObserver((mutations) => {
         for (const m of mutations) {
@@ -2280,6 +2528,81 @@ function runConfigSelfTest(config) {
     results.push({ name: 'decelDistance', pass: decel > 0, detail: `d=${decel.toFixed(2)} floors` });
     const t = computeTimeToReach(config.totalFloors, config.maxVelocity, config.maxAcceleration);
     results.push({ name: 'timeToTop', pass: t > 0, detail: `t=${t.toFixed(2)}s` });
+
+    // Test: dispatcherSelectsNearest
+    const testState = createSystemState({ totalFloors: 20, elevatorCount: 3, maxLoad: 800, maxAcceleration: 1.0, maxVelocity: 2.5, doorOpenTime: 2000, doorCloseTime: 1500, spawnRate: 3000, simSpeed: 1, enableZoning: false });
+    testState.elevators[0].position = 0;
+    testState.elevators[1].position = 10;
+    testState.elevators[2].position = 19;
+    const costs = testState.elevators.map(e => ({ id: e.id, cost: calculateDispatchCost(e, 9, 'up') }));
+    const best = costs.reduce((min, c) => c.cost < min.cost ? c : min);
+    results.push({ name: 'dispatcherSelectsNearest', pass: best.id === 1, detail: `best=${best.id} (pos=${testState.elevators[best.id].position})` });
+
+    // Test: sortTargetFloorsLookUp
+    const testElevUp = { position: 5, direction: 'up', targetFloors: [2, 8, 14, 3, 11] };
+    const tempStateUp = createSystemState(config);
+    tempStateUp.elevators[0] = testElevUp;
+    const originalSort = sortTargetFloors;
+    sortTargetFloors = (id) => {
+        const e = tempStateUp.elevators[id];
+        if (!e || e.targetFloors.length === 0) return;
+        const pos = e.position;
+        const dir = e.direction === 'none' ? 'up' : e.direction;
+        const targets = [...new Set(e.targetFloors)];
+        targets.sort((a, b) => {
+            if (dir === 'up') return a - b;
+            if (dir === 'down') return b - a;
+            const da = Math.abs(a - pos);
+            const db = Math.abs(b - pos);
+            if (da !== db) return da - db;
+            return a - b;
+        });
+        if (dir === 'up') {
+            const below = targets.filter(f => f < pos).sort((a, b) => b - a);
+            const above = targets.filter(f => f >= pos).sort((a, b) => a - b);
+            e.targetFloors = [...above, ...below];
+        } else {
+            const above = targets.filter(f => f > pos).sort((a, b) => a - b);
+            const below = targets.filter(f => f <= pos).sort((a, b) => b - a);
+            e.targetFloors = [...below, ...above];
+        }
+    };
+    sortTargetFloors(0);
+    results.push({ name: 'sortTargetFloorsLookUp', pass: JSON.stringify(testElevUp.targetFloors) === '[8,11,14,3,2]', detail: `result=[${testElevUp.targetFloors}]` });
+    sortTargetFloors = originalSort;
+
+    // Test: sortTargetFloorsLookDown
+    const testElevDown = { position: 10, direction: 'down', targetFloors: [2, 15, 7, 12, 4] };
+    const tempStateDown = createSystemState(config);
+    tempStateDown.elevators[0] = testElevDown;
+    sortTargetFloors = (id) => {
+        const e = tempStateDown.elevators[id];
+        if (!e || e.targetFloors.length === 0) return;
+        const pos = e.position;
+        const dir = e.direction === 'none' ? 'up' : e.direction;
+        const targets = [...new Set(e.targetFloors)];
+        targets.sort((a, b) => {
+            if (dir === 'up') return a - b;
+            if (dir === 'down') return b - a;
+            const da = Math.abs(a - pos);
+            const db = Math.abs(b - pos);
+            if (da !== db) return da - db;
+            return a - b;
+        });
+        if (dir === 'up') {
+            const below = targets.filter(f => f < pos).sort((a, b) => b - a);
+            const above = targets.filter(f => f >= pos).sort((a, b) => a - b);
+            e.targetFloors = [...above, ...below];
+        } else {
+            const above = targets.filter(f => f > pos).sort((a, b) => a - b);
+            const below = targets.filter(f => f <= pos).sort((a, b) => b - a);
+            e.targetFloors = [...below, ...above];
+        }
+    };
+    sortTargetFloors(0);
+    results.push({ name: 'sortTargetFloorsLookDown', pass: testElevDown.targetFloors[0] <= 10 && testElevDown.targetFloors[testElevDown.targetFloors.length - 1] > 10, detail: `result=[${testElevDown.targetFloors}]` });
+    sortTargetFloors = originalSort;
+
     return results;
 }
 
@@ -2305,7 +2628,7 @@ function runConfigSelfTest(config) {
  * Triggers door sequence, passenger exchange, queue updates at current floor.
  *
  * Reference: spawnPassenger() / injectSurge(n)
- * Stochastic passenger generation with Gaussian weight 45–100kg.
+ * Stochastic passenger generation with Gaussian weight 50–130kg.
  *
  * Reference: buildControlPanel / buildSimulationView / buildStatsPanel
  * Construct DOM with inline APP_STYLES; bind sliders to updateConfig → reinitSimulation.
@@ -2328,7 +2651,8 @@ const PHASE6_CHECKLIST = {
         'Speed 1x 2x 5x 10x',
         'Inject Surge 20',
         'Statistics panel 1s refresh',
-        'Save Config guest localStorage / user POST save API'
+        'Save Config guest localStorage / user POST save API',
+        'Fault container DOM ref guard via data-fault-container attribute'
     ],
     '6C_Dispatcher': [
         'dispatchElevator LOOK/SCAN cost score',
@@ -2355,6 +2679,7 @@ const PHASE6_CHECKLIST = {
         'Wait count pulse anime',
         'Fault blink red',
         'Passenger dots enter exit',
+        'Passenger dot click tooltip with journey info',
         'Canvas chart avg wait history 1s'
     ],
     '6G_LoadOnInit': [
