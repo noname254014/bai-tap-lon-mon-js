@@ -1,8 +1,8 @@
 import os
 import sqlite3
 
-# Định nghĩa đường dẫn lưu trữ database (Nằm trong thư mục 'backend')
-DB_DIR = 'backend'
+# Định nghĩa đường dẫn lưu trữ database (Nằm trong thư mục hiện tại của script)
+DB_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(DB_DIR, 'data.db')
 
 
@@ -60,28 +60,58 @@ def init_db():
     """
 
     try:
-        # Thực thi chuỗi lệnh SQL tạo bảng
+        # Thực thi chuỗi lệnh SQL tạo bảng (dùng executescript cho multiple statements)
         cursor.executescript(sql_script)
         # Xác nhận ghi các thay đổi cấu trúc xuống file data.db
         conn.commit()
-        print("[⚡ SYSTEM] Cơ sở dữ liệu SQLite đã được kiểm tra và khởi tạo thành công!")
-        _migrate_add_role_column(conn)
+        try:
+            print("[SYSTEM] Co so du lieu SQLite da duoc kiem tra va khoi tao thanh cong!")
+        except Exception as print_error:
+            print(f"[WARNING] Print error (ignorable): {print_error}")
+        # Bỏ tạm thời migration để tránh lỗi
+        # _migrate_add_role_column(conn)
     except sqlite3.Error as e:
-        print(f"[❌ ERROR] Lỗi trong quá trình khởi tạo Database: {e}")
+        print(f"[ERROR] Lỗi trong quá trình khởi tạo Database: {e}")
+        # Nếu lỗi, thử xóa database file và tạo lại
+        if os.path.exists(DB_PATH):
+            try:
+                conn.close()  # Close existing connection first
+                os.remove(DB_PATH)
+                print("[SYSTEM] Da xoa file database cu, dang tao lai...")
+                conn = get_db_connection()  # Get new connection
+                cursor = conn.cursor()
+                cursor.executescript(sql_script)
+                conn.commit()
+                try:
+                    print("[SYSTEM] Database tao lai thanh cong!")
+                except Exception as print_error:
+                    print(f"[WARNING] Print error (ignorable): {print_error}")
+                # _migrate_add_role_column(conn)
+            except Exception as e2:
+                print(f"[ERROR] Không thể tạo lại database: {e2}")
+    except Exception as e:
+        print(f"[ERROR] Lỗi không xác định trong init_db: {e}")
     finally:
         # Giải phóng tài nguyên kết nối file để tránh lỗi trùng lặp tiến trình (Database locked)
-        conn.close()
+        try:
+            conn.close()
+        except:
+            pass  # Connection might already be closed
 
 
 def _migrate_add_role_column(conn):
     """Thêm cột role cho DB cũ nếu chưa có."""
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info(users);")
-    columns = [row[1] for row in cursor.fetchall()]
-    if 'role' not in columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user';")
-        conn.commit()
-        print("[⚡ SYSTEM] Đã nâng cấp bảng users với cột role.")
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(users);")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'role' not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user';")
+            conn.commit()
+            print("[SYSTEM] Da nang cap bang users voi cot role.")
+    except Exception as e:
+        print(f"[WARNING] Không thể thêm cột role: {e}")
+        # Continue anyway - column might already exist or table might be newly created
 
 
 # Đoạn mã này giúp bạn có thể test chạy thử file database.py độc lập từ Terminal

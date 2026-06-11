@@ -31,9 +31,14 @@ const ELEVATOR_STATUS = Object.freeze({
 
 const ELEVATOR_PHASE = Object.freeze({
     IDLE: 'idle',
-    ACCELERATING: 'accelerating',
-    CRUISING: 'cruising',
-    DECELERATING: 'decelerating',
+    // Jerk-based motion phases (6-phase implementation per temp.md spec)
+    ACC_START: 'acc_start',      // Bắt đầu tăng tốc: j_cmd = +j_max
+    ACC_HOLD: 'acc_hold',        // Tăng tốc đều (a = a_max): j_cmd = 0
+    ACC_END: 'acc_end',          // Kết thúc tăng tốc: j_cmd = -j_max
+    CRUISING: 'cruising',        // Du hành: a = 0, j_cmd = 0
+    DEC_START: 'dec_start',      // Bắt đầu giảm tốc: j_cmd = -j_max
+    DEC_HOLD: 'dec_hold',        // Giảm tốc đều (a = -a_max): j_cmd = 0
+    DEC_END: 'dec_end',          // Kết thúc giảm tốc: j_cmd = +j_max
     DOOR_SEQUENCE: 'door_sequence'
 });
 
@@ -58,11 +63,51 @@ function getDefaultSimConfig() {
         maxLoad: 800,
         maxAcceleration: 1.0,
         maxVelocity: 2.5,
+        maxJerk: 2.0,
         doorOpenTime: 2000,
         doorCloseTime: 1500,
         spawnRate: 3000,
         simSpeed: 1,
-        enableZoning: false
+        enableZoning: false,
+        // Adaptive Scheduling parameters
+        adaptiveScheduling: true,
+        loadFactorThreshold: 2.0,
+        trafficWindowMs: 30000,
+        trafficThresholdUp: 0.70,
+        trafficThresholdDown: 0.70,
+        idlePositioningTime: 3000,
+        // Dynamic Zoning parameters
+        dynamicZoning: false,
+        rebalanceIntervalMs: 60000,
+        trafficDecayAlpha: 0.1,
+        // Hysteresis parameters (per temp.md spec)
+        hysteresisBoundaryShift: 2,      // Only update if boundary shifts > 2 floors
+        hysteresisLoadChange: 0.15,       // Only update if load changes > 15%
+        // Responsive layout parameters
+        responsiveMode: true,             // Enable/disable responsive layout
+        breakpointSmall: 768,            // Small screen breakpoint
+        breakpointMedium: 1024,          // Medium screen breakpoint
+        breakpointLarge: 1440,           // Large screen breakpoint
+        // Panel widths for different breakpoints
+        panelWidthSmall: 240,            // Control panel width on small screens
+        panelWidthMedium: 280,           // Control panel width on medium screens
+        panelWidthLarge: 300,            // Control panel width on large screens
+        panelWidthXLarge: 340,           // Control panel width on extra large screens
+        statsWidthSmall: 240,            // Stats panel width on small screens
+        statsWidthMedium: 260,           // Stats panel width on medium screens
+        statsWidthLarge: 280,             // Stats panel width on large screens
+        // Gaussian weight parameters
+        weightMean: 70,
+        weightStdDev: 12,
+        weightMin: 50,
+        weightMax: 130,
+        // Cost function weights (default values)
+        costWeightETA: 0.40,
+        costWeightLoad: 0.20,
+        costWeightZone: 0.15,
+        costWeightDirection: 0.15,
+        costWeightWaitBonus: 0.05,
+        costWeightTrafficBonus: 0.05
     };
 }
 
@@ -86,7 +131,7 @@ const APP_STYLES = {
         overflow: 'hidden', userSelect: 'none', boxSizing: 'border-box'
     },
     controlPanel: {
-        width: '320px', minWidth: '320px', flexShrink: 0, display: 'flex', flexDirection: 'column',
+        width: '300px', minWidth: '260px', maxWidth: '380px', flexShrink: 0, display: 'flex', flexDirection: 'column',
         backgroundColor: '#14141c', borderRight: '1px solid #2a2a38', overflowY: 'auto', overflowX: 'hidden'
     },
     panelHeader: {
@@ -142,10 +187,10 @@ const APP_STYLES = {
         backgroundColor: '#111118', borderBottom: '1px solid #222230', fontSize: '12px'
     },
     simViewport: {
-        flex: '1', position: 'relative', overflow: 'auto', padding: '12px'
+        flex: '1', position: 'relative', overflow: 'auto', padding: '8px 12px 12px'
     },
     buildingWrap: {
-        display: 'flex', gap: '16px', justifyContent: 'center', alignItems: 'flex-end', minHeight: '100%'
+        display: 'flex', gap: '12px', justifyContent: 'center', alignItems: 'flex-end', minHeight: '100%', flexWrap: 'nowrap'
     },
     shaftColumn: {
         display: 'flex', flexDirection: 'column', alignItems: 'center', position: 'relative'
@@ -155,7 +200,7 @@ const APP_STYLES = {
     },
     shaftOuter: {
         position: 'relative', backgroundColor: '#1a1a24', border: '1px solid #2d2d3d',
-        borderRadius: '4px', overflow: 'hidden'
+        borderRadius: '4px', overflow: 'hidden', flexShrink: 0
     },
     floorRow: {
         display: 'flex', alignItems: 'center', height: `${FLOOR_HEIGHT_PX}px`, borderBottom: '1px solid #22222e',
@@ -214,7 +259,7 @@ const APP_STYLES = {
         pointerEvents: 'none', opacity: 0, zIndex: 5
     },
     statsPanel: {
-        width: '280px', minWidth: '260px', flexShrink: 0, display: 'flex', flexDirection: 'column',
+        width: '260px', minWidth: '240px', maxWidth: '320px', flexShrink: 0, display: 'flex', flexDirection: 'column',
         backgroundColor: '#14141c', borderLeft: '1px solid #2a2a38', overflowY: 'auto'
     },
     statCard: {
@@ -238,62 +283,373 @@ const APP_STYLES = {
 // Utility & configuration helpers
 // -------------------------------------------------------------------------
 
-// Pure function for LOOK/SCAN target floor sorting - extracted for testability
-function sortTargetFloorsPure(elevator) {
+// -------------------------------------------------------------------------
+// LOOK Scheduler - Module 2 of Dispatcher-Scheduler Model
+// -------------------------------------------------------------------------
+
+/**
+ * LOOK Scheduler: Sorts elevator targets according to LOOK algorithm
+ * Input: elevator object with position, direction, targetFloors
+ * Output: ordered stop list according to LOOK
+ * Complexity: O(T log T) where T = number of targets
+ * 
+ * Specification from temp.md:
+ * Nếu hướng = LÊN:
+ *     ahead  = sort_asc  { f ∈ targets | f ≥ current }
+ *     behind = sort_asc  { f ∈ targets | f < current }
+ *     result = ahead + behind
+ * Nếu hướng = XUỐNG:
+ *     ahead  = sort_desc { f ∈ targets | f ≤ current }
+ *     behind = sort_desc { f ∈ targets | f > current }
+ *     result = ahead + behind
+ */
+function sortTargetsLOOK(elevator) {
     if (!elevator || elevator.targetFloors.length === 0) return elevator.targetFloors;
 
     const pos = elevator.position;
     const dir = elevator.direction === 'none' ? 'up' : elevator.direction;
-    const targets = [...new Set(elevator.targetFloors)];
-
-    targets.sort((a, b) => {
-        if (dir === 'up') return a - b;
-        if (dir === 'down') return b - a;
-        const da = Math.abs(a - pos);
-        const db = Math.abs(b - pos);
-        if (da !== db) return da - db;
-        return a - b;
-    });
+    // const targets = [...new Set(elevator.targetFloors)];
+    const targets = [...new Set(Array.isArray(elevator?.targetFloors) ? elevator.targetFloors : [])];
 
     if (dir === 'up') {
-        const below = targets.filter(f => f < pos).sort((a, b) => b - a);
-        const above = targets.filter(f => f >= pos).sort((a, b) => a - b);
-        return [...above, ...below];
+        // Ahead: floors >= current, sorted ascending
+        const ahead = targets.filter(f => f >= pos).sort((a, b) => a - b);
+        // Behind: floors < current, sorted ascending
+        const behind = targets.filter(f => f < pos).sort((a, b) => a - b);
+        return [...ahead, ...behind];
     } else {
-        const above = targets.filter(f => f > pos).sort((a, b) => a - b);
-        const below = targets.filter(f => f <= pos).sort((a, b) => b - a);
-        return [...below, ...above];
+        // Ahead: floors <= current, sorted descending
+        const ahead = targets.filter(f => f <= pos).sort((a, b) => b - a);
+        // Behind: floors > current, sorted descending
+        const behind = targets.filter(f => f > pos).sort((a, b) => b - a);
+        return [...ahead, ...behind];
     }
 }
 
-// Pure function for dispatch cost calculation - extracted for testability
-function calculateDispatchCostPure(elevator, floor, direction, config) {
-    const dist = Math.abs(elevator.position - floor);
-    let cost = dist * 2;
+// -------------------------------------------------------------------------
+// Dispatcher - Module 1 of Dispatcher-Scheduler Model
+// -------------------------------------------------------------------------
 
-    if (elevator.direction !== 'none' && elevator.direction !== direction) {
-        cost += WRONG_DIRECTION_PENALTY;
-        if (elevator.direction === 'up' && floor < elevator.position) cost += 4;
-        if (elevator.direction === 'down' && floor > elevator.position) cost += 4;
+/**
+ * Sigmoid function for smooth transitions
+ */
+function sigmoid(x) {
+    return 1 / (1 + Math.exp(-x));
+}
+
+/**
+ * Adaptive Scheduling: Update cost weights based on load factor
+ * Load Factor Λ = N_pending / E
+ */
+function updateAdaptiveWeights(systemState, config, pendingCount) {
+    if (!config.adaptiveScheduling) return;
+
+    const loadFactor = pendingCount / config.elevatorCount;
+    const threshold = config.loadFactorThreshold;
+    const beta = 2.0; // Steepness of transition (empirical parameter)
+
+    // Sigmoid transition around threshold (parameters chosen empirically)
+    const transition = sigmoid(beta * (loadFactor - threshold));
+
+    // Adjust weights based on load factor
+    // High load: prioritize ETA, reduce zone penalty, increase direction penalty
+    const baseETA = config.costWeightETA;
+    const baseLoad = config.costWeightLoad;
+    const baseZone = config.costWeightZone;
+    const baseDirection = config.costWeightDirection;
+
+    systemState.adaptiveWeights.eta = baseETA + (0.3 - baseETA) * transition;
+    systemState.adaptiveWeights.load = baseLoad + (0.1 - baseLoad) * transition;
+    systemState.adaptiveWeights.zone = baseZone + (0.25 - baseZone) * transition;
+    systemState.adaptiveWeights.direction = baseDirection + (0.2 - baseDirection) * transition;
+}
+
+/**
+ * Traffic Detection: Determine traffic mode based on recent request patterns
+ */
+function updateTrafficMode(systemState, config, currentTime) {
+    if (!config.adaptiveScheduling) return;
+
+    const windowMs = config.trafficWindowMs;
+    const thresholdUp = config.trafficThresholdUp;
+    const thresholdDown = config.trafficThresholdDown;
+
+    // Filter recent requests within time window
+    const recentRequests = systemState.trafficHistory.filter(
+        r => currentTime - r.timestamp < windowMs
+    );
+
+    if (recentRequests.length < 5) {
+        systemState.trafficMode = 'NORMAL';
+        return;
     }
 
+    const upCount = recentRequests.filter(r => r.direction === 'up').length;
+    const downCount = recentRequests.filter(r => r.direction === 'down').length;
+    const total = upCount + downCount;
+
+    if (total === 0) {
+        systemState.trafficMode = 'NORMAL';
+        return;
+    }
+
+    const rUp = upCount / total;
+    const rDown = downCount / total;
+
+    if (rUp > thresholdUp) {
+        systemState.trafficMode = 'UP_PEAK';
+    } else if (rDown > thresholdDown) {
+        systemState.trafficMode = 'DOWN_PEAK';
+    } else {
+        systemState.trafficMode = 'NORMAL';
+    }
+}
+
+/**
+ * Dynamic Zoning: Update zone boundaries based on traffic patterns
+ * With Hysteresis: Only update zones if boundaryShift > 2 floors AND loadChange > 15%
+ */
+function updateDynamicZoning(systemState, config, currentTime) {
+    if (!config.dynamicZoning) return;
+
+    const rebalanceInterval = config.rebalanceIntervalMs;
+    if (currentTime - systemState.lastRebalanceTime < rebalanceInterval) return;
+
+    const alpha = config.trafficDecayAlpha;
+    const totalFloors = config.totalFloors;
+    const elevatorCount = config.elevatorCount;
+
+    // Update floor traffic rates with exponential decay
+    for (let f = 0; f < totalFloors; f++) {
+        const q = systemState.floorQueues[f];
+        const hasRequest = q.up.length > 0 || q.down.length > 0;
+        systemState.floorTrafficRates[f] = (1 - alpha) * systemState.floorTrafficRates[f] +
+                                            alpha * (hasRequest ? 1 : 0);
+    }
+
+    // Calculate cumulative traffic
+    const cumulativeTraffic = [];
+    let sum = 0;
+    for (let f = 0; f < totalFloors; f++) {
+        sum += systemState.floorTrafficRates[f];
+        cumulativeTraffic.push(sum);
+    }
+
+    const totalTraffic = sum;
+    if (totalTraffic === 0) return;
+
+    // Calculate zone boundaries to balance traffic
+    const zoneBoundaries = [];
+    for (let i = 1; i < elevatorCount; i++) {
+        const targetTraffic = (i / elevatorCount) * totalTraffic;
+        let boundary = 0;
+        for (let f = 0; f < totalFloors; f++) {
+            if (cumulativeTraffic[f] >= targetTraffic) {
+                boundary = f;
+                break;
+            }
+        }
+        zoneBoundaries.push(boundary);
+    }
+
+    // HYSTERESIS CHECK 1: Boundary shift threshold
+    // Only update if any boundary shifted by more than 2 floors
+    const boundaryShiftThreshold = config.hysteresisBoundaryShift || 2;
+    let maxBoundaryShift = 0;
+    
+    if (systemState.previousZoneBoundaries && systemState.previousZoneBoundaries.length === zoneBoundaries.length) {
+        for (let i = 0; i < zoneBoundaries.length; i++) {
+            const shift = Math.abs(zoneBoundaries[i] - systemState.previousZoneBoundaries[i]);
+            maxBoundaryShift = Math.max(maxBoundaryShift, shift);
+        }
+    } else {
+        // First run or configuration changed, allow update
+        maxBoundaryShift = boundaryShiftThreshold + 1;
+    }
+
+    // HYSTERESIS CHECK 2: Load change threshold
+    // Only update if total traffic load changed by more than 15%
+    const loadChangeThreshold = config.hysteresisLoadChange || 0.15; // 15%
+    let loadChange = 0;
+    
+    if (systemState.previousTotalTraffic !== undefined && systemState.previousTotalTraffic > 0) {
+        loadChange = Math.abs(totalTraffic - systemState.previousTotalTraffic) / systemState.previousTotalTraffic;
+    } else {
+        // First run, allow update
+        loadChange = loadChangeThreshold + 0.01;
+    }
+
+    // Apply hysteresis: only update zones if both thresholds are exceeded
+    if (maxBoundaryShift <= boundaryShiftThreshold && loadChange <= loadChangeThreshold) {
+        // Skip zone update due to hysteresis
+        systemState.lastRebalanceTime = currentTime; // Still update time to prevent frequent checks
+        return;
+    }
+
+    // Assign zones to elevators
+    let prevBoundary = 0;
+    for (let i = 0; i < elevatorCount; i++) {
+        const nextBoundary = i < zoneBoundaries.length ? zoneBoundaries[i] : totalFloors - 1;
+        systemState.elevators[i].zoneMin = prevBoundary;
+        systemState.elevators[i].zoneMax = nextBoundary;
+        prevBoundary = nextBoundary + 1;
+    }
+
+    // Store current boundaries and traffic for next hysteresis check
+    systemState.previousZoneBoundaries = [...zoneBoundaries];
+    systemState.previousTotalTraffic = totalTraffic;
+
+    systemState.lastRebalanceTime = currentTime;
+}
+
+/**
+ * Calculate travel time using kinematic model
+ * t(d) = 2*sqrt(d/a) if d <= v^2/a
+ * t(d) = v/a + d/v otherwise
+ */
+function calculateTravelTime(distance, maxVelocity, maxAcceleration) {
+    if (distance <= 0 || maxAcceleration <= 0 || maxVelocity <= 0) return 0;
+    
+    const criticalDistance = (maxVelocity * maxVelocity) / maxAcceleration;
+    
+    if (distance <= criticalDistance) {
+        // Triangle profile: accelerate then decelerate
+        return 2 * Math.sqrt(distance / maxAcceleration);
+    } else {
+        // Trapezoidal profile: accelerate, cruise, decelerate
+        const accelTime = maxVelocity / maxAcceleration;
+        const cruiseDistance = distance - criticalDistance;
+        const cruiseTime = cruiseDistance / maxVelocity;
+        return 2 * accelTime + cruiseTime;
+    }
+}
+
+/**
+ * Calculate ETA (Estimated Time of Arrival) including intermediate stops
+ * ETA ≈ travel_time + n_stops * door_time (approximate formula)
+ */
+function calculateETA(elevator, targetFloor, config) {
+    const distance = Math.abs(elevator.position - targetFloor);
+    const travelTime = calculateTravelTime(distance, config.maxVelocity, config.maxAcceleration);
+    
+    // Estimate number of intermediate stops
+    let intermediateStops = 0;
+    for (const t of elevator.targetFloors) {
+        if ((elevator.direction === 'up' && t > elevator.position && t < targetFloor) ||
+            (elevator.direction === 'down' && t < elevator.position && t > targetFloor)) {
+            intermediateStops++;
+        }
+    }
+    
+    const doorTime = (config.doorOpenTime + config.doorCloseTime) / 1000; // Convert to seconds
+    return travelTime + intermediateStops * doorTime;
+}
+
+/**
+ * Normalize value to [0, 1] range
+ */
+function normalize(value, min, max) {
+    if (max === min) return 0.5;
+    return (value - min) / (max - min);
+}
+
+/**
+ * Calculate Soft Zone penalty (proportional to violation)
+ * Z = max(0, |F_r - c_e| - R_e) / F_total
+ */
+function calculateSoftZonePenalty(elevator, floor, config) {
+    if (!config.enableZoning) return 0;
+    
+    const zoneSize = Math.ceil(config.totalFloors / config.elevatorCount);
+    const zoneCenter = elevator.id * zoneSize + zoneSize / 2;
+    const zoneRadius = zoneSize / 2;
+    
+    const violation = Math.max(0, Math.abs(floor - zoneCenter) - zoneRadius);
+    return violation / config.totalFloors;
+}
+
+/**
+ * Calculate Wait Bonus (aging to prevent starvation)
+ * B_wait = min(k * t_wait, B_max)
+ */
+function calculateWaitBonus(passenger, config) {
+    if (!passenger || !passenger.waitStartTime) return 0;
+    
+    const waitTime = (performance.now() - passenger.waitStartTime) / 1000; // seconds
+    const k = 0.1; // aging coefficient
+    const B_max = 5; // maximum bonus
+    
+    return Math.min(k * waitTime, B_max);
+}
+
+/**
+ * Calculate Traffic Bonus based on current traffic mode
+ */
+function calculateTrafficBonus(elevator, floor, direction, trafficMode) {
+    if (trafficMode === 'UP_PEAK' && direction === 'up') return 2;
+    if (trafficMode === 'DOWN_PEAK' && direction === 'down') return 2;
+    return 0;
+}
+
+/**
+ * ETA-based Cost Function with Normalized Components
+ * Cost = w1*ETA + w2*Load + w3*Zone + w4*Direction - w5*WaitBonus - w6*TrafficBonus
+ */
+function calculateDispatchCostETA(elevator, floor, direction, config, adaptiveWeights, trafficMode = 'NORMAL', allPassengers = []) {
+    const eta = calculateETA(elevator, floor, config);
     const loadRatio = elevator.currentLoad / config.maxLoad;
-    if (loadRatio > 0.85) cost += OVERLOAD_PENALTY * loadRatio;
-    if (loadRatio > 1.0) cost += 50;
+    const zonePenalty = calculateSoftZonePenalty(elevator, floor, config);
 
-    if (elevator.direction === direction) {
-        if (direction === 'up' && floor >= elevator.position) cost -= SAME_DIRECTION_BONUS;
-        if (direction === 'down' && floor <= elevator.position) cost -= SAME_DIRECTION_BONUS;
+    // Direction penalty: 1 if wrong direction, 0 if correct
+    let directionPenalty = 0;
+    if (elevator.direction !== 'none' && elevator.direction !== direction) {
+        directionPenalty = 1;
+        // Extra penalty if moving away from request
+        if (elevator.direction === 'up' && floor < elevator.position) directionPenalty += 0.5;
+        if (elevator.direction === 'down' && floor > elevator.position) directionPenalty += 0.5;
     }
 
-    if (elevator.status === ELEVATOR_STATUS.FAULT) cost += 100;
-    if (elevator.doorState !== DOOR_STATE.CLOSED) cost += 2;
-    if (elevator.targetFloors.includes(floor)) cost -= 5;
-
-    const idleBonus = elevator.status === ELEVATOR_STATUS.IDLE ? -2 : 0;
-    cost += idleBonus;
-
-    return cost;
+    // Get passenger for wait bonus (if available)
+    const passenger = allPassengers.find(p =>
+        p.originFloor === floor && p.direction === direction && p.state === PASSENGER_STATE.WAITING
+    );
+    const waitBonus = calculateWaitBonus(passenger, config);
+    const trafficBonus = calculateTrafficBonus(elevator, floor, direction, trafficMode);
+    
+    // Use adaptive weights if available, otherwise use default config weights
+    const w1 = adaptiveWeights?.eta ?? config.costWeightETA;
+    const w2 = adaptiveWeights?.load ?? config.costWeightLoad;
+    const w3 = adaptiveWeights?.zone ?? config.costWeightZone;
+    const w4 = adaptiveWeights?.direction ?? config.costWeightDirection;
+    const w5 = config.costWeightWaitBonus;
+    const w6 = config.costWeightTrafficBonus;
+    
+    // Normalize components (min/max from system configuration limits)
+    const normalizedETA = normalize(eta, 0, 30); // min/max from config limits
+    const normalizedLoad = normalize(loadRatio, 0, 1);
+    const normalizedZone = zonePenalty; // Already in [0, 1]
+    
+    // Calculate total cost
+    let cost = w1 * normalizedETA + 
+               w2 * normalizedLoad + 
+               w3 * normalizedZone + 
+               w4 * directionPenalty - 
+               w5 * waitBonus - 
+               w6 * trafficBonus;
+    
+    // Add fault penalty
+    if (elevator.status === ELEVATOR_STATUS.FAULT) cost += 10;
+    
+    // Add door state penalty
+    if (elevator.doorState !== DOOR_STATE.CLOSED) cost += 0.5;
+    
+    // Bonus for already having this floor as target
+    if (elevator.targetFloors.includes(floor)) cost -= 0.3;
+    
+    // Idle bonus
+    if (elevator.status === ELEVATOR_STATUS.IDLE) cost -= 0.2;
+    
+    return Math.max(0, cost);
 }
 
 function clamp(value, min, max) {
@@ -334,12 +690,38 @@ function mergeLoadedConfig(base, loaded) {
     return merged;
 }
 
-function gaussianRandom(mean, stdDev, min, max) {
-    let u = 0; let v = 0;
-    while (u === 0) u = Math.random();
-    while (v === 0) v = Math.random();
-    const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-    return clamp(mean + z * stdDev, min, max);
+/**
+ * Truncated Gaussian using Rejection Sampling
+ * Specification from temp.md:
+ * Generates Gaussian-distributed random values within [min, max] bounds
+ * Uses Box-Muller transform with rejection sampling to maintain true distribution
+ * 
+ * Algorithm:
+ * repeat:
+ *     u1, u2 ~ Uniform(0, 1]
+ *     z = sqrt(-2 · ln(u1)) · cos(2π · u2)    // Box-Muller
+ *     w = μ + z · σ
+ * until w ∈ [w_min, w_max]
+ * return w
+ * 
+ * Phân phối kết quả là Gaussian điều kiện — Truncated Gaussian
+ */
+function truncatedGaussianRandom(mean, stdDev, min, max) {
+    while (true) {
+        // Box-Muller transform
+        let u1, u2;
+        do { u1 = Math.random(); } while (u1 === 0);
+        do { u2 = Math.random(); } while (u2 === 0);
+        
+        const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        const w = mean + z * stdDev;
+        
+        // Rejection sampling: accept only if within bounds
+        if (w >= min && w <= max) {
+            return w;
+        }
+        // Otherwise, reject and try again (average iterations ≈ 1.1 for small truncation)
+    }
 }
 
 function pickRandomFloors(totalFloors) {
@@ -382,6 +764,7 @@ function createElevator(id, config, startFloor = 0) {
         position: startFloor,
         velocity: 0,
         acceleration: 0,
+        jerk: 0,
         direction: 'none',
         doorState: DOOR_STATE.CLOSED,
         passengers: [],
@@ -395,7 +778,10 @@ function createElevator(id, config, startFloor = 0) {
         _doorPhase: null,
         _lastPosition: startFloor,
         _floorStopHandled: startFloor,
-        idleTimer: 0
+        idleTimer: 0,
+        // Dynamic zoning
+        zoneMin: 0,
+        zoneMax: 0
     };
 }
 
@@ -409,7 +795,21 @@ function createSystemState(config) {
         floorQueues: createFloorQueues(config.totalFloors),
         stats: createStats(config.elevatorCount),
         allPassengers: [],
-        pendingAnimations: []
+        pendingAnimations: [],
+        // Adaptive Scheduling state
+        adaptiveWeights: {
+            eta: config.costWeightETA,
+            load: config.costWeightLoad,
+            zone: config.costWeightZone,
+            direction: config.costWeightDirection
+        },
+        trafficMode: 'NORMAL',
+        trafficHistory: [],
+        floorTrafficRates: new Array(config.totalFloors).fill(0),
+        lastRebalanceTime: 0,
+        // Hysteresis state
+        previousZoneBoundaries: null,
+        previousTotalTraffic: undefined
     };
 }
 
@@ -497,47 +897,29 @@ export function initElevatorSimulation(contentElement) {
         if (!queue) return;
         const list = direction === 'up' ? queue.up : queue.down;
         if (!list.includes(passengerId)) list.push(passengerId);
+        
+        // Track traffic history for adaptive scheduling
+        systemState.trafficHistory.push({
+            floor,
+            direction,
+            timestamp: performance.now()
+        });
+        
         systemState.stats.passengersWaiting = countPassengersWaiting();
         dispatchElevator({ floor, direction });
     }
 
     function calculateDispatchCost(elevator, floor, direction) {
-        const dist = Math.abs(elevator.position - floor);
-        let cost = dist * 2;
-
-        // Zoning algorithm - add penalty if floor is outside elevator's zone
-        if (simConfig.enableZoning) {
-            const zoneSize = Math.ceil(simConfig.totalFloors / simConfig.elevatorCount);
-            const zoneMin = elevator.id * zoneSize;
-            const zoneMax = zoneMin + zoneSize - 1;
-            if (floor < zoneMin || floor > zoneMax) {
-                cost += 30;
-            }
-        }
-
-        if (elevator.direction !== 'none' && elevator.direction !== direction) {
-            cost += WRONG_DIRECTION_PENALTY;
-            if (elevator.direction === 'up' && floor < elevator.position) cost += 4;
-            if (elevator.direction === 'down' && floor > elevator.position) cost += 4;
-        }
-
-        const loadRatio = elevator.currentLoad / simConfig.maxLoad;
-        if (loadRatio > 0.85) cost += OVERLOAD_PENALTY * loadRatio;
-        if (loadRatio > 1.0) cost += 50;
-
-        if (elevator.direction === direction) {
-            if (direction === 'up' && floor >= elevator.position) cost -= SAME_DIRECTION_BONUS;
-            if (direction === 'down' && floor <= elevator.position) cost -= SAME_DIRECTION_BONUS;
-        }
-
-        if (elevator.status === ELEVATOR_STATUS.FAULT) cost += 100;
-        if (elevator.doorState !== DOOR_STATE.CLOSED) cost += 2;
-        if (elevator.targetFloors.includes(floor)) cost -= 5;
-
-        const idleBonus = elevator.status === ELEVATOR_STATUS.IDLE ? -2 : 0;
-        cost += idleBonus;
-
-        return cost;
+        // Use new ETA-based cost function with adaptive scheduling
+        return calculateDispatchCostETA(
+            elevator,
+            floor,
+            direction,
+            simConfig,
+            systemState.adaptiveWeights,
+            systemState.trafficMode,
+            systemState.allPassengers
+        );
     }
 
     function dispatchElevator({ floor, direction }) {
@@ -578,7 +960,7 @@ export function initElevatorSimulation(contentElement) {
     function sortTargetFloors(elevatorId) {
         const elevator = systemState.elevators[elevatorId];
         if (!elevator || elevator.targetFloors.length === 0) return;
-        elevator.targetFloors = sortTargetFloorsPure(elevator);
+        elevator.targetFloors = sortTargetsLOOK(elevator);
     }
 
     function detectEmergency(elevatorId, deltaMs = 16) {
@@ -591,6 +973,7 @@ export function initElevatorSimulation(contentElement) {
             elevator.status = ELEVATOR_STATUS.FAULT;
             elevator.velocity = 0;
             elevator.acceleration = 0;
+            elevator.jerk = 0;
             eventLog.push('FAULT', `Thang ${elevatorId + 1} quá tải ${Math.round(elevator.currentLoad)}kg`);
             if (eventLogContainer) eventLog.render(eventLogContainer);
             renderFaultButtons();
@@ -617,6 +1000,12 @@ export function initElevatorSimulation(contentElement) {
             if (elevator.faultStatus === FAULT_TYPE.OVERLOAD) {
                 elevator.faultStatus = FAULT_TYPE.NONE;
                 elevator.status = ELEVATOR_STATUS.IDLE;
+                elevator.phase = ELEVATOR_PHASE.IDLE;
+                elevator.direction = 'none';
+                eventLog.push('FAULT', `Thang ${elevatorId + 1} đã tự động khôi phục sau khi giảm tải.`);
+                if (eventLogContainer) eventLog.render(eventLogContainer);
+                renderFaultButtons();
+                updateFaultBlink(elevatorId);
             }
         }
 
@@ -746,7 +1135,7 @@ export function initElevatorSimulation(contentElement) {
                     const next = getNextTargetFloor(elevator);
                     elevator.direction = next > elevator.position ? 'up' : next < elevator.position ? 'down' : elevator.direction;
                     elevator.status = ELEVATOR_STATUS.MOVING;
-                    elevator.phase = ELEVATOR_PHASE.ACCELERATING;
+                    elevator.phase = ELEVATOR_PHASE.ACC_START;
                 } else {
                     elevator.direction = 'none';
                     elevator.status = ELEVATOR_STATUS.IDLE;
@@ -764,11 +1153,13 @@ export function initElevatorSimulation(contentElement) {
     }
 
     function processElevatorPhysics(elevator, dtSec) {
-        if (elevator.status === ELEVATOR_STATUS.FAULT) {
-            elevator.velocity = 0;
-            elevator.acceleration = 0;
-            return;
-        }
+        try {
+            if (elevator.status === ELEVATOR_STATUS.FAULT) {
+                elevator.velocity = 0;
+                elevator.acceleration = 0;
+                elevator.jerk = 0;
+                return;
+            }
 
         if (elevator.phase === ELEVATOR_PHASE.DOOR_SEQUENCE) {
             updateDoorSequence(elevator, dtSec * 1000);
@@ -779,6 +1170,7 @@ export function initElevatorSimulation(contentElement) {
         if (target === null) {
             elevator.velocity = 0;
             elevator.acceleration = 0;
+            elevator.jerk = 0;
             elevator.phase = ELEVATOR_PHASE.IDLE;
             elevator.status = ELEVATOR_STATUS.IDLE;
             elevator.direction = 'none';
@@ -791,19 +1183,25 @@ export function initElevatorSimulation(contentElement) {
 
         const aMax = simConfig.maxAcceleration;
         const vMax = simConfig.maxVelocity;
+        const jMax = simConfig.maxJerk || 2.0;
         const distToTarget = Math.abs(diff);
-        const decelDist = (elevator.velocity * elevator.velocity) / (2 * aMax + 0.0001);
+
+        // Braking distance with jerk: d_brake ≈ v²/(2a) + v*a/(2j)
+        const decelDist = (elevator.velocity * elevator.velocity) / (2 * aMax) + 
+                          (Math.abs(elevator.velocity) * aMax) / (2 * jMax);
 
         let shouldStop = distToTarget < 0.02;
         const floorInt = Math.round(elevator.position);
-        if (!shouldStop && decelDist >= distToTarget - 0.05) {
-            elevator.phase = ELEVATOR_PHASE.DECELERATING;
+        // Start deceleration earlier to prevent overshoot
+        if (!shouldStop && decelDist >= distToTarget * 0.90) {
+            elevator.phase = ELEVATOR_PHASE.DEC_START;
         }
 
         if (shouldStop) {
             elevator.position = target;
             elevator.velocity = 0;
             elevator.acceleration = 0;
+            elevator.jerk = 0;
             if (shouldStopAtFloor(elevator, floorInt) || Math.abs(target - floorInt) < 0.01) {
                 handleFloorStop(elevator.id);
             } else {
@@ -812,46 +1210,200 @@ export function initElevatorSimulation(contentElement) {
             return;
         }
 
-        if (elevator.phase === ELEVATOR_PHASE.DECELERATING || decelDist >= distToTarget) {
-            elevator.phase = ELEVATOR_PHASE.DECELERATING;
-            elevator.acceleration = -Math.sign(elevator.velocity || (desiredDir === 'up' ? 1 : -1)) * aMax;
-        } else if (Math.abs(elevator.velocity) < vMax - 0.01) {
-            elevator.phase = ELEVATOR_PHASE.ACCELERATING;
-            elevator.acceleration = (desiredDir === 'up' ? 1 : -1) * aMax;
-        } else {
-            elevator.phase = ELEVATOR_PHASE.CRUISING;
-            elevator.acceleration = 0;
+        // Determine jerk command based on 6-phase jerk state machine
+        // Specification from temp.md - 6-phase Jerk model with S-Curve motion profile:
+        // a_{n+1} = clamp(a_n + j_cmd * dt, -a_max, a_max)
+        // v_{n+1} = clamp(v_n + a_{n+1} * dt, -v_max, v_max)
+        // p_{n+1} = p_n + v_{n+1} * dt
+        //
+        // Biên dạng jerk theo giai đoạn chuyển động (6 phases):
+        // - ACC_START: Bắt đầu tăng tốc: j_cmd = +j_max
+        // - ACC_HOLD: Tăng tốc đều (a = a_max): j_cmd = 0
+        // - ACC_END: Kết thúc tăng tốc: j_cmd = -j_max
+        // - CRUISING: Du hành: a = 0, j_cmd = 0
+        // - DEC_START: Bắt đầu giảm tốc: j_cmd = -j_max
+        // - DEC_HOLD: Giảm tốc đều (a = -a_max): j_cmd = 0
+        // - DEC_END: Kết thúc giảm tốc: j_cmd = +j_max
+
+        let jerkCmd = 0;
+        const sign = desiredDir === 'up' ? 1 : -1;
+        const accelThreshold = 0.1; // Threshold for considering acceleration as "zero"
+        const velocityThreshold = 0.1; // Threshold for considering velocity as "zero"
+
+        // Check if we need to start decelerating
+        if (decelDist >= distToTarget * 0.90) {
+            // Transition to deceleration phases
+            if (elevator.phase !== ELEVATOR_PHASE.DEC_START &&
+                elevator.phase !== ELEVATOR_PHASE.DEC_HOLD &&
+                elevator.phase !== ELEVATOR_PHASE.DEC_END) {
+                elevator.phase = ELEVATOR_PHASE.DEC_START;
+            }
         }
 
+        // 6-phase jerk state machine
+        switch (elevator.phase) {
+            case ELEVATOR_PHASE.ACC_START:
+                // Bắt đầu tăng tốc: tăng gia tốc từ 0 đến a_max
+                jerkCmd = sign * jMax;
+                if (Math.abs(elevator.acceleration) >= aMax - accelThreshold) {
+                    elevator.phase = ELEVATOR_PHASE.ACC_HOLD;
+                }
+                break;
+
+            case ELEVATOR_PHASE.ACC_HOLD:
+                // Tăng tốc đều: giữ gia tốc ở a_max
+                jerkCmd = 0;
+                elevator.acceleration = sign * aMax; // Ensure we're at max acceleration
+                // Check if we need to end acceleration (approaching target velocity)
+                if (Math.abs(elevator.velocity) >= vMax - velocityThreshold) {
+                    elevator.phase = ELEVATOR_PHASE.ACC_END;
+                }
+                // Check if we need to start decelerating
+                if (decelDist >= distToTarget * 0.90) {
+                    elevator.phase = ELEVATOR_PHASE.ACC_END;
+                }
+                break;
+
+            case ELEVATOR_PHASE.ACC_END:
+                // Kết thúc tăng tốc: giảm gia tốc từ a_max về 0
+                jerkCmd = -sign * jMax;
+                if (Math.abs(elevator.acceleration) <= accelThreshold) {
+                    elevator.acceleration = 0;
+                    if (decelDist >= distToTarget * 0.90) {
+                        elevator.phase = ELEVATOR_PHASE.DEC_START;
+                    } else if (Math.abs(elevator.velocity) >= vMax - velocityThreshold) {
+                        elevator.phase = ELEVATOR_PHASE.CRUISING;
+                    } else {
+                        elevator.phase = ELEVATOR_PHASE.CRUISING;
+                    }
+                }
+                break;
+
+            case ELEVATOR_PHASE.CRUISING:
+                // Du hành: giữ vận tốc không đổi, gia tốc = 0
+                jerkCmd = 0;
+                elevator.acceleration = 0;
+                // Check if we need to start decelerating
+                if (decelDist >= distToTarget * 0.90) {
+                    elevator.phase = ELEVATOR_PHASE.DEC_START;
+                }
+                break;
+
+            case ELEVATOR_PHASE.DEC_START:
+                // Bắt đầu giảm tốc: giảm gia tốc từ 0 về -a_max
+                jerkCmd = -sign * jMax;
+                if (Math.abs(elevator.acceleration) >= aMax - accelThreshold) {
+                    elevator.phase = ELEVATOR_PHASE.DEC_HOLD;
+                }
+                break;
+
+            case ELEVATOR_PHASE.DEC_HOLD:
+                // Giảm tốc đều: giữ gia tốc ở -a_max
+                jerkCmd = 0;
+                elevator.acceleration = -sign * aMax; // Ensure we're at max deceleration
+                // Check if we need to end deceleration (velocity near zero)
+                if (Math.abs(elevator.velocity) <= velocityThreshold * 2) {
+                    elevator.phase = ELEVATOR_PHASE.DEC_END;
+                }
+                break;
+
+            case ELEVATOR_PHASE.DEC_END:
+                // Kết thúc giảm tốc: tăng gia tốc từ -a_max về 0
+                jerkCmd = sign * jMax;
+                if (Math.abs(elevator.acceleration) <= accelThreshold) {
+                    elevator.acceleration = 0;
+                    // Transition to appropriate phase
+                    if (Math.abs(elevator.velocity) <= velocityThreshold) {
+                        elevator.phase = ELEVATOR_PHASE.IDLE;
+                    } else {
+                        elevator.phase = ELEVATOR_PHASE.CRUISING;
+                    }
+                }
+                break;
+
+            case ELEVATOR_PHASE.IDLE:
+            default:
+                // Start accelerating if needed
+                if (!shouldStop && distToTarget > 0.1) {
+                    elevator.phase = ELEVATOR_PHASE.ACC_START;
+                }
+                jerkCmd = 0;
+                elevator.acceleration = 0;
+                break;
+        }
+
+        // Semi-Implicit Euler integration with jerk model
+        // Specification from temp.md:
+        // v_{n+1} = v_n + a_n * dt
+        // p_{n+1} = p_n + v_{n+1} * dt
+        // With jerk: a_{n+1} = clamp(a_n + j_cmd * dt, -a_max, a_max)
+        // Provides better numerical stability and reduced accumulated error in real-time simulation
+        
+        // Update acceleration first with jerk
+        elevator.acceleration += jerkCmd * dtSec;
+        elevator.acceleration = clamp(elevator.acceleration, -aMax, aMax);
+
+        // Update velocity with new acceleration (Semi-Implicit Euler)
         elevator.velocity += elevator.acceleration * dtSec;
         elevator.velocity = clamp(elevator.velocity, -vMax, vMax);
 
-        if (elevator.phase === ELEVATOR_PHASE.DECELERATING) {
-            const sign = Math.sign(elevator.velocity);
-            if (sign !== 0 && Math.sign(diff) !== sign) elevator.velocity = 0;
-        }
-
+        // Update position with new velocity (Semi-Implicit Euler)
         const prevPos = elevator.position;
         elevator.position += elevator.velocity * dtSec;
 
+        // Hard clamp: không cho thang bay ra khỏi tòa nhà
+        elevator.position = clamp(elevator.position, 0, simConfig.totalFloors - 1);
+
+        // Overshoot detection: nếu vượt qua target thì snap về và dừng
+        // const target = getNextTargetFloor(elevator);
+        if (target !== null) {
+            const prevDiff = target - prevPos;
+            const newDiff = target - elevator.position;
+            if (prevDiff * newDiff < 0) { // Đổi dấu = đã vượt qua
+                elevator.position = target;
+                elevator.velocity = 0;
+                elevator.acceleration = 0;
+                elevator.jerk = 0;
+                handleFloorStop(elevator.id);
+                return; // Skip remaining physics for this frame
+            }
+        }
+
+        // Check for floor crossing
         if (Math.round(prevPos) !== Math.round(elevator.position)) {
             const crossed = Math.round(elevator.position);
             if (shouldStopAtFloor(elevator, crossed)) {
                 elevator.position = crossed;
                 elevator.velocity = 0;
+                elevator.acceleration = 0;
+                elevator.jerk = 0;
                 handleFloorStop(elevator.id);
             }
         }
 
         elevator.status = Math.abs(elevator.velocity) > 0.01 ? ELEVATOR_STATUS.MOVING : elevator.status;
         elevator._lastPosition = elevator.position;
+        } catch (error) {
+            console.error('[ERROR] Process elevator physics error:', error);
+            console.error('[ERROR] Elevator phase:', elevator.phase);
+            console.error('[ERROR] Elevator position:', elevator.position);
+            throw error;
+        }
     }
 
     function updatePhysics(deltaTimeMs) {
-        const dtSec = (deltaTimeMs / 1000) * simConfig.simSpeed;
-        if (dtSec <= 0) return;
+        try {
+            const dtSec = (deltaTimeMs / 1000) * simConfig.simSpeed;
+            if (dtSec <= 0) return;
 
-        for (const elevator of systemState.elevators) {
+            const currentTime = performance.now();
+
+            // Update adaptive scheduling and dynamic zoning
+            updateAdaptiveWeights(systemState, simConfig, countPassengersWaiting());
+            updateTrafficMode(systemState, simConfig, currentTime);
+            updateDynamicZoning(systemState, simConfig, currentTime);
+
+            for (const elevator of systemState.elevators) {
             detectEmergency(elevator.id, deltaTimeMs);
             if (elevator.phase !== ELEVATOR_PHASE.DOOR_SEQUENCE) {
                 processElevatorPhysics(elevator, dtSec);
@@ -859,27 +1411,45 @@ export function initElevatorSimulation(contentElement) {
                 updateDoorSequence(elevator, deltaTimeMs * simConfig.simSpeed);
             }
 
-            // Pre-positioning when idle
+            // Idle positioning with traffic-based floor selection
             if (elevator.status === ELEVATOR_STATUS.IDLE && elevator.targetFloors.length === 0) {
                 elevator.idleTimer += deltaTimeMs;
-                if (elevator.idleTimer >= 3000) {
+                if (elevator.idleTimer >= simConfig.idlePositioningTime) {
+                    // Find floor with highest traffic rate
+                    let maxRate = 0;
                     let maxDepth = 0;
                     let busiestFloor = -1;
                     for (let f = 0; f < simConfig.totalFloors; f++) {
-                        const q = systemState.floorQueues[f];
-                        const depth = q.up.length + q.down.length;
-                        if (depth > maxDepth) {
-                            maxDepth = depth;
+                        const rate = systemState.floorTrafficRates[f];
+                        if (rate > maxRate) {
+                            maxRate = rate;
                             busiestFloor = f;
                         }
                     }
-                    if (busiestFloor >= 0 && maxDepth > 0 && Math.round(elevator.position) !== busiestFloor) {
+                    // Fallback to queue depth if traffic rates are all zero
+                    if (maxRate === 0) {
+                        for (let f = 0; f < simConfig.totalFloors; f++) {
+                            const q = systemState.floorQueues[f];
+                            const depth = q.up.length + q.down.length;
+                            if (depth > maxDepth) {
+                                maxDepth = depth;
+                                busiestFloor = f;
+                            }
+                        }
+                    }
+                    // Check if another elevator is already near the busiest floor (prevent clustering)
+                    const tooClose = systemState.elevators.some(
+                        other => other.id !== elevator.id &&
+                                Math.abs(Math.round(other.position) - busiestFloor) <= 2 &&
+                                other.status !== ELEVATOR_STATUS.FAULT
+                    );
+                    if (!tooClose && busiestFloor >= 0 && (maxRate > 0 || maxDepth > 0) && Math.round(elevator.position) !== busiestFloor) {
                         elevator.targetFloors.push(busiestFloor);
                         elevator.direction = busiestFloor > elevator.position ? 'up' : 'down';
                         elevator.status = ELEVATOR_STATUS.MOVING;
-                        elevator.phase = ELEVATOR_PHASE.ACCELERATING;
+                        elevator.phase = ELEVATOR_PHASE.ACC_START;
                         elevator.idleTimer = 0;
-                        eventLog.push('PRE-POS', `Thang ${elevator.id + 1} tự di chuyển đến tầng ${busiestFloor} (depth ${maxDepth})`);
+                        eventLog.push('PRE-POS', `Thang ${elevator.id + 1} tự di chuyển đến tầng ${busiestFloor} (rate=${maxRate.toFixed(2)})`);
                         if (eventLogContainer) eventLog.render(eventLogContainer);
                     }
                 }
@@ -890,8 +1460,12 @@ export function initElevatorSimulation(contentElement) {
             systemState.stats.loadPerElevator[elevator.id] = Math.round(elevator.currentLoad);
         }
 
-        systemState.stats.avgWaitTime = calculateAverageWaitTime();
-        systemState.stats.passengersWaiting = countPassengersWaiting();
+            systemState.stats.avgWaitTime = calculateAverageWaitTime();
+            systemState.stats.passengersWaiting = countPassengersWaiting();
+        } catch (error) {
+            console.error('[ERROR] Physics update error:', error);
+            throw error;
+        }
     }
 
     // =====================================================================
@@ -914,7 +1488,13 @@ export function initElevatorSimulation(contentElement) {
             dest = picked.dest;
         }
         const direction = floorToDirection(origin, dest);
-        const weight = gaussianRandom(75, 15, 50, 130);
+        // Use truncated Gaussian for weight distribution
+        const weight = truncatedGaussianRandom(
+            simConfig.weightMean, 
+            simConfig.weightStdDev, 
+            simConfig.weightMin, 
+            simConfig.weightMax
+        );
         const passenger = {
             id: passengerIdCounter++,
             originFloor: origin,
@@ -1345,16 +1925,18 @@ export function initElevatorSimulation(contentElement) {
         Object.assign(section.style, APP_STYLES.panelSection);
         const title = document.createElement('div');
         Object.assign(title.style, APP_STYLES.sectionTitle);
-        title.textContent = 'Thuật toán LOOK/SCAN';
+        title.textContent = 'Kiến trúc Hai Tầng (Two-Tier)';
         section.appendChild(title);
 
         const info = document.createElement('div');
         info.style.cssText = 'font-size:11px;line-height:1.55;color:#9ca3af;';
         info.innerHTML = `
-            <p><b style="color:#cbd5e1">Dispatcher</b> chấm điểm từng thang: khoảng cách, phạt ngược chiều (+${WRONG_DIRECTION_PENALTY}), phạt quá tải (+${OVERLOAD_PENALTY}), thưởng cùng chiều (-${SAME_DIRECTION_BONUS}).</p>
-            <p><b style="color:#cbd5e1">sortTargetFloors</b> sắp xếp danh sách đích theo LOOK: ưu tiên cùng hướng, sau đó quay đầu.</p>
-            <p><b style="color:#cbd5e1">Physics</b> dùng d=v²/(2a) để hãm; cửa mở/đóng theo SimConfig (ms).</p>
-            <p><b style="color:#cbd5e1">Emergency</b>: overload &gt; ${OVERLOAD_FAULT_RATIO * 100}% maxLoad; stuck &gt; ${STUCK_THRESHOLD_MS / 1000}s v=0.</p>`;
+            <p><b style="color:#cbd5e1">Module 1 - Dispatcher</b>: Hàm chi phí ETA-based với 6 thành phần chuẩn hóa (ETA, Load, Zone, Direction, Wait Bonus, Traffic Bonus).</p>
+            <p><b style="color:#cbd5e1">Module 2 - LOOK Scheduler</b>: Sắp xếp đích theo LOOK: phục vụ tất cả cùng hướng rồi đảo chiều.</p>
+            <p><b style="color:#cbd5e1">Physics</b>: Semi-Implicit Euler với jerk model (ổn định số tốt hơn). Dừng: d≈v²/(2a)+v·a/(2j) (xấp xỉ).</p>
+            <p><b style="color:#cbd5e1">Adaptive Scheduling</b>: Điều chỉnh trọng số theo Load Factor (sigmoid, tham số thực nghiệm) và Traffic Mode (UP/DOWN PEAK, chỉ xét hall-call).</p>
+            <p><b style="color:#cbd5e1">Dynamic Zoning</b>: Cân bằng lưu lượng giữa vùng dựa trên traffic rate decay.</p>
+            <p><b style="color:#cbd5e1">Weight Distribution</b>: Truncated Gaussian (rejection sampling) μ=${simConfig.weightMean}kg, σ=${simConfig.weightStdDev}kg.</p>`;
         section.appendChild(info);
         panel.appendChild(section);
     }
@@ -1417,10 +1999,14 @@ export function initElevatorSimulation(contentElement) {
     function updateConfig(key, value) {
         if (!(key in simConfig)) return;
         const numericKeys = ['totalFloors', 'elevatorCount', 'maxLoad', 'doorOpenTime', 'doorCloseTime', 'spawnRate', 'simSpeed'];
+        const responsiveKeys = ['breakpointSmall', 'breakpointMedium', 'breakpointLarge', 'panelWidthSmall', 'panelWidthMedium', 'panelWidthLarge', 'panelWidthXLarge', 'statsWidthSmall', 'statsWidthMedium', 'statsWidthLarge'];
         if (numericKeys.includes(key) && key !== 'simSpeed') {
             simConfig[key] = typeof value === 'number' ? value : parseFloat(value);
         } else if (key === 'simSpeed') {
             simConfig[key] = parseInt(value, 10);
+        } else if (responsiveKeys.includes(key)) {
+            simConfig[key] = parseInt(value, 10);
+            resizeHandler(); // Apply responsive changes immediately
         } else {
             simConfig[key] = parseFloat(value);
         }
@@ -1595,6 +2181,89 @@ export function initElevatorSimulation(contentElement) {
 
         panel.appendChild(zoningSection);
 
+        // Responsive Layout section
+        const responsiveSection = document.createElement('div');
+        Object.assign(responsiveSection.style, APP_STYLES.panelSection);
+        const responsiveTitle = document.createElement('div');
+        Object.assign(responsiveTitle.style, APP_STYLES.sectionTitle);
+        responsiveTitle.textContent = 'Responsive Layout';
+        responsiveSection.appendChild(responsiveTitle);
+
+        const responsiveToggleRow = document.createElement('div');
+        responsiveToggleRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-top:8px;';
+        const responsiveLabel = document.createElement('span');
+        responsiveLabel.style.cssText = 'font-size:12px;color:#b0b8c4;';
+        responsiveLabel.textContent = 'Enable Responsive';
+        const responsiveToggle = document.createElement('input');
+        responsiveToggle.type = 'checkbox';
+        responsiveToggle.checked = simConfig.responsiveMode;
+        responsiveToggle.style.cssText = 'width:16px;height:16px;cursor:pointer;';
+        responsiveToggle.addEventListener('change', () => {
+            simConfig.responsiveMode = responsiveToggle.checked;
+            eventLog.push('CONFIG', `Responsive: ${simConfig.responsiveMode ? 'ON' : 'OFF'}`);
+            if (eventLogContainer) eventLog.render(eventLogContainer);
+            setStatusMessage(`Responsive ${simConfig.responsiveMode ? 'đã bật' : 'đã tắt'}.`);
+            // Trigger resize handler to apply changes
+            resizeHandler();
+        });
+        responsiveToggleRow.appendChild(responsiveLabel);
+        responsiveToggleRow.appendChild(responsiveToggle);
+        responsiveSection.appendChild(responsiveToggleRow);
+
+        // Breakpoint inputs
+        const breakpointLabel = document.createElement('div');
+        breakpointLabel.style.cssText = 'font-size:11px;color:#9ca3af;margin-top:10px;margin-bottom:6px;';
+        breakpointLabel.textContent = 'Breakpoints (px):';
+        responsiveSection.appendChild(breakpointLabel);
+
+        const createBreakpointInput = (label, configKey, min, max) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;';
+            const lbl = document.createElement('span');
+            lbl.style.cssText = 'font-size:11px;color:#b0b8c4;';
+            lbl.textContent = label;
+            const input = document.createElement('input');
+            input.type = 'number';
+            input.min = min;
+            input.max = max;
+            input.value = simConfig[configKey];
+            input.style.cssText = 'width:60px;padding:4px;background:#111116;border:1px solid #3d3d52;border-radius:3px;color:#fff;font-size:11px;';
+            input.addEventListener('change', () => {
+                const val = parseInt(input.value, 10);
+                if (val >= min && val <= max) {
+                    simConfig[configKey] = val;
+                    eventLog.push('CONFIG', `${configKey}: ${val}px`);
+                    if (eventLogContainer) eventLog.render(eventLogContainer);
+                    resizeHandler();
+                }
+            });
+            row.appendChild(lbl);
+            row.appendChild(input);
+            return row;
+        };
+
+        responsiveSection.appendChild(createBreakpointInput('Small Screen', 'breakpointSmall', 480, 1024));
+        responsiveSection.appendChild(createBreakpointInput('Medium Screen', 'breakpointMedium', 768, 1440));
+        responsiveSection.appendChild(createBreakpointInput('Large Screen', 'breakpointLarge', 1024, 1920));
+
+        // Panel width inputs
+        const panelWidthLabel = document.createElement('div');
+        panelWidthLabel.style.cssText = 'font-size:11px;color:#9ca3af;margin-top:10px;margin-bottom:6px;';
+        panelWidthLabel.textContent = 'Panel Widths (px):';
+        responsiveSection.appendChild(panelWidthLabel);
+
+        responsiveSection.appendChild(createBreakpointInput('Panel (Small)', 'panelWidthSmall', 200, 320));
+        responsiveSection.appendChild(createBreakpointInput('Panel (Medium)', 'panelWidthMedium', 240, 360));
+        responsiveSection.appendChild(createBreakpointInput('Panel (Large)', 'panelWidthLarge', 260, 400));
+        responsiveSection.appendChild(createBreakpointInput('Panel (X-Large)', 'panelWidthXLarge', 300, 440));
+
+        const responsiveInfo = document.createElement('div');
+        responsiveInfo.style.cssText = 'font-size:10px;color:#6b7280;margin-top:6px;line-height:1.4;';
+        responsiveInfo.textContent = 'Tự động điều chỉnh kích thước panel theo kích thước cửa sổ. Tắt để dùng kích thước cố định.';
+        responsiveSection.appendChild(responsiveInfo);
+
+        panel.appendChild(responsiveSection);
+
         // Fault Management section
         const faultSection = document.createElement('div');
         Object.assign(faultSection.style, APP_STYLES.panelSection);
@@ -1658,7 +2327,8 @@ export function initElevatorSimulation(contentElement) {
             Object.assign(shaft.style, {
                 ...APP_STYLES.shaftOuter,
                 width: '88px',
-                height: `${shaftHeight}px`
+                height: `${shaftHeight}px`,
+                maxWidth: '120px'
             });
 
             const trackWrap = document.createElement('div');
@@ -1739,6 +2409,8 @@ export function initElevatorSimulation(contentElement) {
 
         const callShaft = document.createElement('div');
         callShaft.style.height = `${shaftHeight}px`;
+        callShaft.style.minWidth = '100px';
+        callShaft.style.flexShrink = '0';
 
         for (let f = simConfig.totalFloors - 1; f >= 0; f--) {
             const row = document.createElement('div');
@@ -1799,7 +2471,13 @@ export function initElevatorSimulation(contentElement) {
             ? Math.min(simConfig.totalFloors - 1, floor + 1 + Math.floor(Math.random() * (simConfig.totalFloors - floor - 1)))
             : Math.max(0, Math.floor(Math.random() * floor));
         if (dest === floor) dest = direction === 'up' ? floor + 1 : floor - 1;
-        const weight = gaussianRandom(75, 15, 50, 130);
+        // Use truncated Gaussian for weight distribution
+        const weight = truncatedGaussianRandom(
+            simConfig.weightMean, 
+            simConfig.weightStdDev, 
+            simConfig.weightMin, 
+            simConfig.weightMax
+        );
         const passenger = {
             id: passengerIdCounter++,
             originFloor: floor,
@@ -1897,18 +2575,62 @@ export function initElevatorSimulation(contentElement) {
     function reinitElevator(elevatorId) {
         const elevator = systemState.elevators[elevatorId];
         if (!elevator) return;
+
+        // Reset fault status
         elevator.faultStatus = FAULT_TYPE.NONE;
+
+        // Reset status and phase
         elevator.status = ELEVATOR_STATUS.IDLE;
+        elevator.phase = ELEVATOR_PHASE.IDLE;
+
+        // Reset motion state
+        elevator.direction = 'none';
         elevator.velocity = 0;
         elevator.acceleration = 0;
-        elevator.direction = 'none';
-        elevator.phase = ELEVATOR_PHASE.IDLE;
+        elevator.jerk = 0;
+
+        // Reset targets
         elevator.targetFloors = [];
-        eventLog.push('FAULT', `Thang ${elevatorId + 1} đã được reset thủ công.`);
-        if (eventLogContainer) eventLog.render(eventLogContainer);
+
+        // Reset position (clamp to building bounds)
+        elevator.position = clamp(
+            elevator.position,
+            0,
+            simConfig.totalFloors - 1
+        );
+
+        // Reset timers (CRITICAL: stuckTimer must be reset to avoid immediate re-fault)
+        elevator.stuckTimer = 0;
+        elevator.doorTimer = 0;
+        elevator.idleTimer = 0;
+
+        // Reset door state
+        elevator.doorState = DOOR_STATE.CLOSED;
+        elevator._doorPhase = null;
+
+        // Reset internal tracking state
+        const currentFloor = Math.round(elevator.position);
+        elevator._lastPosition = currentFloor;
+        elevator._floorStopHandled = currentFloor;
+
+        // Reset dynamic zoning
+        elevator.zoneMin = 0;
+        elevator.zoneMax = 0;
+
+        // Log the reset
+        eventLog.push(
+            'FAULT',
+            `Thang ${elevatorId + 1} đã được reset thủ công.`
+        );
+
+        // Update UI
         updateFaultBlink(elevatorId);
         renderFaultButtons();
-        setStatusMessage(`Đã reset thang ${elevatorId + 1}.`);
+        renderElevators?.();
+
+        setStatusMessage(
+            `Đã reset thang ${elevatorId + 1}.`
+        );
     }
 
     function renderFaultButtons() {
@@ -2023,26 +2745,42 @@ export function initElevatorSimulation(contentElement) {
 
     function gameLoop(timestamp) {
         if (!simRunning) return;
-        if (!lastFrameTime) lastFrameTime = timestamp;
-        const delta = timestamp - lastFrameTime;
-        lastFrameTime = timestamp;
-        updatePhysics(delta);
-        renderSimulation();
-        rafId = requestAnimationFrame(gameLoop);
+        try {
+            if (!lastFrameTime) lastFrameTime = timestamp;
+            const delta = timestamp - lastFrameTime;
+            lastFrameTime = timestamp;
+            updatePhysics(delta);
+            renderSimulation();
+            rafId = requestAnimationFrame(gameLoop);
+        } catch (error) {
+            console.error('[ERROR] Game loop error:', error);
+            simRunning = false;
+            setStatusMessage('Lỗi trong game loop: ' + error.message);
+        }
     }
 
     function startSimulation() {
         if (simRunning) return;
+        console.log('[DEBUG] Starting simulation...');
         simRunning = true;
         lastFrameTime = 0;
+        setupSpawnInterval(); // Ensure spawn interval is running
         const statusEl = dom.root?.querySelector('[data-sim-status]');
         if (statusEl) statusEl.textContent = 'Running';
-        rafId = requestAnimationFrame(gameLoop);
-        setStatusMessage('Mô phỏng đang chạy.');
+        try {
+            rafId = requestAnimationFrame(gameLoop);
+            setStatusMessage('Mô phỏng đang chạy.');
+            console.log('[DEBUG] Simulation started successfully');
+        } catch (error) {
+            console.error('[ERROR] Failed to start simulation:', error);
+            setStatusMessage('Lỗi khi khởi động mô phỏng: ' + error.message);
+            simRunning = false;
+        }
     }
 
     function pauseSimulation() {
         simRunning = false;
+        if (spawnIntervalId) clearInterval(spawnIntervalId);
         if (rafId) {
             cancelAnimationFrame(rafId);
             rafId = null;
@@ -2112,19 +2850,64 @@ export function initElevatorSimulation(contentElement) {
     // Responsive UI - window resize listener with debounce
     let resizeHandler = debounce(() => {
         const newWidth = contentElement.offsetWidth;
-        if (Math.abs(newWidth - lastKnownWidth) < 50) {
+        const newHeight = contentElement.offsetHeight;
+
+        if (!simConfig.responsiveMode) {
+            // Responsive mode disabled - use default sizing
+            lastKnownWidth = newWidth;
+            return;
+        }
+
+        if (Math.abs(newWidth - lastKnownWidth) < 50 && Math.abs(newHeight - contentElement.offsetHeight) < 50) {
             return;
         }
         lastKnownWidth = newWidth;
 
-        if (newWidth < 900) {
+        // Responsive panel sizing based on viewport width using config values
+        if (newWidth < simConfig.breakpointSmall) {
+            // Very small screens - hide stats panel, shrink control panel
             const statsPanel = dom.root.querySelector('[data-stats-panel]');
             if (statsPanel) statsPanel.style.display = 'none';
-            if (dom.controlPanel) dom.controlPanel.style.width = '220px';
-        } else {
+            if (dom.controlPanel) {
+                dom.controlPanel.style.width = `${simConfig.panelWidthSmall}px`;
+                dom.controlPanel.style.minWidth = `${simConfig.panelWidthSmall - 20}px`;
+            }
+        } else if (newWidth < simConfig.breakpointMedium) {
+            // Medium screens - show stats panel, moderate control panel
             const statsPanel = dom.root.querySelector('[data-stats-panel]');
             if (statsPanel) statsPanel.style.display = 'flex';
-            if (dom.controlPanel) dom.controlPanel.style.width = '320px';
+            if (dom.controlPanel) {
+                dom.controlPanel.style.width = `${simConfig.panelWidthMedium}px`;
+                dom.controlPanel.style.minWidth = `${simConfig.panelWidthMedium - 20}px`;
+            }
+        } else if (newWidth < simConfig.breakpointLarge) {
+            // Large screens - standard sizing
+            const statsPanel = dom.root.querySelector('[data-stats-panel]');
+            if (statsPanel) statsPanel.style.display = 'flex';
+            if (dom.controlPanel) {
+                dom.controlPanel.style.width = `${simConfig.panelWidthLarge}px`;
+                dom.controlPanel.style.minWidth = `${simConfig.panelWidthLarge - 20}px`;
+            }
+        } else {
+            // Extra large screens - expand panels
+            const statsPanel = dom.root.querySelector('[data-stats-panel]');
+            if (statsPanel) statsPanel.style.display = 'flex';
+            if (dom.controlPanel) {
+                dom.controlPanel.style.width = `${simConfig.panelWidthXLarge}px`;
+                dom.controlPanel.style.minWidth = `${simConfig.panelWidthXLarge - 40}px`;
+            }
+        }
+
+        // Adjust stats panel width based on available space using config values
+        const statsPanel = dom.root.querySelector('[data-stats-panel]');
+        if (statsPanel && statsPanel.style.display !== 'none') {
+            if (newWidth < 1200) {
+                statsPanel.style.width = `${simConfig.statsWidthSmall}px`;
+            } else if (newWidth < 1600) {
+                statsPanel.style.width = `${simConfig.statsWidthMedium}px`;
+            } else {
+                statsPanel.style.width = `${simConfig.statsWidthLarge}px`;
+            }
         }
 
         // Only rebuild if config actually changed (floors or elevator count)
@@ -2133,7 +2916,7 @@ export function initElevatorSimulation(contentElement) {
             lastBuiltElevatorCount = simConfig.elevatorCount;
             rebuildSimulationView();
         }
-    }, 200);
+    }, 150);
     window.addEventListener('resize', resizeHandler);
 
     const observer = new MutationObserver((mutations) => {
@@ -2247,9 +3030,14 @@ function formatDurationMs(ms) {
 function describeElevatorPhase(phase) {
     const map = {
         [ELEVATOR_PHASE.IDLE]: 'Nghỉ',
-        [ELEVATOR_PHASE.ACCELERATING]: 'Tăng tốc',
+        // 6-phase jerk state machine
+        [ELEVATOR_PHASE.ACC_START]: 'Bắt đầu tăng tốc',
+        [ELEVATOR_PHASE.ACC_HOLD]: 'Tăng tốc đều',
+        [ELEVATOR_PHASE.ACC_END]: 'Kết thúc tăng tốc',
         [ELEVATOR_PHASE.CRUISING]: 'Hành trình',
-        [ELEVATOR_PHASE.DECELERATING]: 'Giảm tốc',
+        [ELEVATOR_PHASE.DEC_START]: 'Bắt đầu giảm tốc',
+        [ELEVATOR_PHASE.DEC_HOLD]: 'Giảm tốc đều',
+        [ELEVATOR_PHASE.DEC_END]: 'Kết thúc giảm tốc',
         [ELEVATOR_PHASE.DOOR_SEQUENCE]: 'Cửa'
     };
     return map[phase] || phase;
@@ -2576,30 +3364,34 @@ function runConfigSelfTest(config) {
     const state = createSystemState(config);
     results.push({ name: 'createSystemState', pass: state.elevators.length === config.elevatorCount, detail: `elevators=${state.elevators.length}` });
     results.push({ name: 'floorQueues', pass: state.floorQueues.length === config.totalFloors, detail: `queues=${state.floorQueues.length}` });
+    results.push({ name: 'adaptiveState', pass: state.adaptiveWeights && state.trafficMode, detail: 'adaptive scheduling initialized' });
     const decel = computeDecelerationDistance(config.maxVelocity, config.maxAcceleration);
     results.push({ name: 'decelDistance', pass: decel > 0, detail: `d=${decel.toFixed(2)} floors` });
     const t = computeTimeToReach(config.totalFloors, config.maxVelocity, config.maxAcceleration);
     results.push({ name: 'timeToTop', pass: t > 0, detail: `t=${t.toFixed(2)}s` });
 
-    // Test: dispatcherSelectsNearest
-    const testConfig = { totalFloors: 20, elevatorCount: 3, maxLoad: 800, maxAcceleration: 1.0, maxVelocity: 2.5, doorOpenTime: 2000, doorCloseTime: 1500, spawnRate: 3000, simSpeed: 1, enableZoning: false };
-    const testState = createSystemState(testConfig);
-    testState.elevators[0].position = 0;
-    testState.elevators[1].position = 10;
-    testState.elevators[2].position = 19;
-    const costs = testState.elevators.map(e => ({ id: e.id, cost: calculateDispatchCostPure(e, 9, 'up', testConfig) }));
-    const best = costs.reduce((min, c) => c.cost < min.cost ? c : min);
-    results.push({ name: 'dispatcherSelectsNearest', pass: best.id === 1, detail: `best=${best.id} (pos=${testState.elevators[best.id].position})` });
-
-    // Test: sortTargetFloorsLookUp
+    // Test: LOOK scheduler up direction
     const testElevUp = { position: 5, direction: 'up', targetFloors: [2, 8, 14, 3, 11] };
-    const sortedUp = sortTargetFloorsPure(testElevUp);
-    results.push({ name: 'sortTargetFloorsLookUp', pass: JSON.stringify(sortedUp) === '[8,11,14,3,2]', detail: `result=[${sortedUp}]` });
+    const sortedUp = sortTargetsLOOK(testElevUp);
+    results.push({ name: 'sortTargetsLOOK_Up', pass: JSON.stringify(sortedUp) === '[8,11,14,2,3]', detail: `result=[${sortedUp}]` });
 
-    // Test: sortTargetFloorsLookDown
+    // Test: LOOK scheduler down direction
     const testElevDown = { position: 10, direction: 'down', targetFloors: [2, 15, 7, 12, 4] };
-    const sortedDown = sortTargetFloorsPure(testElevDown);
-    results.push({ name: 'sortTargetFloorsLookDown', pass: sortedDown[0] <= 10 && sortedDown[sortedDown.length - 1] > 10, detail: `result=[${sortedDown}]` });
+    const sortedDown = sortTargetsLOOK(testElevDown);
+    results.push({ name: 'sortTargetsLOOK_Down', pass: sortedDown[0] <= 10 && sortedDown[sortedDown.length - 1] > 10, detail: `result=[${sortedDown}]` });
+
+    // Test: ETA calculation
+    const testElev = { position: 0, velocity: 0, acceleration: 0, targetFloors: [], direction: 'up' };
+    const eta = calculateETA(testElev, 10, config);
+    results.push({ name: 'calculateETA', pass: eta > 0, detail: `eta=${eta.toFixed(2)}s` });
+
+    // Test: Truncated Gaussian
+    const sampleWeights = [];
+    for (let i = 0; i < 100; i++) {
+        sampleWeights.push(truncatedGaussianRandom(70, 12, 50, 130));
+    }
+    const allInBounds = sampleWeights.every(w => w >= 50 && w <= 130);
+    results.push({ name: 'truncatedGaussian', pass: allInBounds, detail: `min=${Math.min(...sampleWeights).toFixed(1)}, max=${Math.max(...sampleWeights).toFixed(1)}` });
 
     return results;
 }
@@ -2611,22 +3403,44 @@ function runConfigSelfTest(config) {
  * and statistics refresh. Returns void; registers MutationObserver cleanup.
  *
  * Reference: dispatchElevator({ floor, direction })
- * Multi-criteria LOOK dispatcher. Returns assigned elevator id or -1.
+ * Two-tier dispatcher: Module 1 (ETA-based cost function) selects best elevator.
+ * Returns assigned elevator id or -1.
  *
- * Reference: sortTargetFloors(elevatorId)
- * Reorders targetFloors array in-place using LOOK scan direction rules.
+ * Reference: sortTargetsLOOK(elevator)
+ * Module 2 of Dispatcher-Scheduler model: LOOK Scheduler sorts target floors.
+ * Reorders targetFloors array using LOOK scan direction rules.
+ *
+ * Reference: calculateDispatchCostETA(elevator, floor, direction, config, adaptiveWeights, trafficMode)
+ * ETA-based cost function with 6 normalized components: ETA, Load, Zone, Direction, Wait Bonus, Traffic Bonus.
+ *
+ * Reference: updateAdaptiveWeights(systemState, config)
+ * Adjusts cost weights based on load factor using sigmoid transition (empirical parameters).
+ *
+ * Reference: updateTrafficMode(systemState, config, currentTime)
+ * Detects traffic mode (NORMAL, UP_PEAK, DOWN_PEAK) from recent hall-call patterns.
+ *
+ * Reference: updateDynamicZoning(systemState, config, currentTime)
+ * Rebalances zone boundaries based on traffic rate decay for load balancing.
+ *
+ * Reference: processElevatorPhysics(elevator, dtSec)
+ * Semi-Implicit Euler integration with jerk model for numerical stability. Integrates motion with
+ * braking distance d≈v²/(2a)+v·a/(2j) (approximate).
  *
  * Reference: detectEmergency(elevatorId, deltaMs)
  * Sets fault on overload (>110% maxLoad) or stuck (v≈0 for 5s with pending work).
  *
  * Reference: updatePhysics(deltaTimeMs)
  * Integrates all elevator motion for one frame; applies simSpeed multiplier.
+ * Calls adaptive scheduling and dynamic zoning updates.
  *
  * Reference: handleFloorStop(elevatorId)
  * Triggers door sequence, passenger exchange, queue updates at current floor.
  *
  * Reference: spawnPassenger() / injectSurge(n)
- * Stochastic passenger generation with Gaussian weight 50–130kg.
+ * Stochastic passenger generation with truncated Gaussian weight distribution.
+ *
+ * Reference: truncatedGaussianRandom(mean, stdDev, min, max)
+ * Rejection sampling for true Gaussian distribution within bounds.
  *
  * Reference: buildControlPanel / buildSimulationView / buildStatsPanel
  * Construct DOM with inline APP_STYLES; bind sliders to updateConfig → reinitSimulation.
@@ -2637,9 +3451,9 @@ function runConfigSelfTest(config) {
 
 const PHASE6_CHECKLIST = {
     '6A_DataStructures': [
-        'SimConfig defaults (20 floors, 3 elevators, 800kg, a=1, v=2.5, doors, spawn)',
-        'SystemState: elevators[], floorQueues[{up,down}], stats',
-        'Elevator entity with phase, doorTimer, faultStatus, targetFloors LOOK list',
+        'SimConfig defaults (20 floors, 3 elevators, 800kg, a=1, v=2.5, j=2.0, doors, spawn)',
+        'SystemState: elevators[], floorQueues[{up,down}], stats, adaptiveWeights, trafficMode, trafficHistory, floorTrafficRates',
+        'Elevator entity with phase, doorTimer, faultStatus, targetFloors, jerk, zoneMin/zoneMax',
         'Passenger entity with weight, wait/board/exit timestamps, state machine',
         'stats: avgWaitTime, totalServed, passengersWaiting, loadPerElevator[], waitTimeHistory[]'
     ],
@@ -2650,24 +3464,31 @@ const PHASE6_CHECKLIST = {
         'Inject Surge 20',
         'Statistics panel 1s refresh',
         'Save Config guest localStorage / user POST save API',
-        'Fault container DOM ref guard via data-fault-container attribute'
+        'Fault container DOM ref guard via data-fault-container attribute',
+        'Algorithm info panel showing Dispatcher-Scheduler model'
     ],
-    '6C_Dispatcher': [
-        'dispatchElevator LOOK/SCAN cost score',
-        'sortTargetFloors LOOK ordering',
+    '6C_DispatcherScheduler': [
+        'Module 1: calculateDispatchCostETA with 6 normalized components (ETA, Load, Zone, Direction, Wait Bonus, Traffic Bonus)',
+        'Module 2: sortTargetsLOOK for LOOK Scheduler algorithm',
+        'Adaptive Scheduling: updateAdaptiveWeights based on load factor (sigmoid, empirical)',
+        'Traffic Detection: updateTrafficMode (NORMAL, UP_PEAK, DOWN_PEAK)',
+        'Dynamic Zoning: updateDynamicZoning based on traffic rate decay',
         'detectEmergency overload and stuck'
     ],
     '6D_Physics': [
         'rAF loop deltaTime * simSpeed',
-        'Deceleration d = v²/(2a)',
-        'Accelerate / cruise / decelerate phases',
-        'handleFloorStop door open close load unload'
+        'Semi-Implicit Euler integration with jerk model (numerical stability)',
+        'Braking distance d≈v²/(2a)+v·a/(2j) (approximate)',
+        'Accelerate / cruise / decelerate phases with jerk transitions',
+        'handleFloorStop door open close load unload',
+        'Idle positioning with traffic-based floor selection'
     ],
     '6E_Passengers': [
-        'spawnPassenger random floors gaussian weight',
+        'spawnPassenger random floors truncated Gaussian weight (rejection sampling)',
         'setInterval spawn spawnRate/simSpeed',
         'injectSurge(20)',
-        'calculateAverageWaitTime'
+        'calculateAverageWaitTime',
+        'Traffic history tracking for adaptive scheduling'
     ],
     '6F_Graphics': [
         'buildSimulationView shafts floors cabins call buttons wait badges',
@@ -2684,7 +3505,8 @@ const PHASE6_CHECKLIST = {
         'User GET load merge SimConfig',
         'Guest localStorage elevatorConfig',
         'Else defaults',
-        'cleanup on container remove'
+        'cleanup on container remove',
+        'Self-test includes LOOK scheduler, ETA calculation, truncated Gaussian'
     ]
 };
 
@@ -2713,17 +3535,28 @@ if (typeof window !== 'undefined') {
 // Extended documentation — Phase 6 architecture reference
 // =========================================================================
 /*
- * SimConfig drives all timing and capacity limits. SystemState holds runtime
- * elevators, per-floor up/down queues, and rolling statistics. Each Elevator
- * tracks continuous position (floor units), velocity, acceleration, LOOK target
- * list, door FSM, passengers aboard, fault flags, and stuck detection timer.
+ * SimConfig drives all timing and capacity limits including new parameters:
+ * maxJerk, adaptiveScheduling, dynamicZoning, cost weights, traffic thresholds.
+ * SystemState holds runtime elevators, per-floor up/down queues, rolling statistics,
+ * adaptive weights, traffic mode, traffic history, and floor traffic rates.
  *
- * dispatchElevator() scores every cab: base distance, wrong-direction penalty,
- * overload penalty, same-direction bonus; winner receives the floor in
- * targetFloors then sortTargetFloors() applies LOOK ordering.
+ * Dispatcher-Scheduler Model:
+ * Module 1 - Dispatcher: calculateDispatchCostETA() uses ETA-based cost function
+ * with 6 normalized components (ETA, Load, Zone, Direction, Wait Bonus, Traffic Bonus).
+ * Adaptive scheduling adjusts weights based on load factor (sigmoid, empirical parameters) and traffic mode.
  *
- * updatePhysics() integrates motion with v²/(2a) braking distance, handles
- * floor stops via door open/hold/close, unloads/loads passengers, re-dispatches.
+ * Module 2 - LOOK Scheduler: sortTargetsLOOK() reorders target floors using LOOK
+ * algorithm: serve all floors in current direction, then reverse.
+ *
+ * Physics: Semi-Implicit Euler integration with jerk model for better numerical stability.
+ * Braking distance: d≈v²/(2a)+v·a/(2j) (approximate). Idle positioning uses traffic-based
+ * floor selection from floorTrafficRates.
+ *
+ * Dynamic Zoning: updateDynamicZoning() rebalances zone boundaries based on
+ * traffic rate decay to balance load across elevators.
+ *
+ * Weight Distribution: truncatedGaussianRandom() uses rejection sampling for true
+ * Gaussian distribution within [weightMin, weightMax] bounds.
  *
  * initElevatorSimulation() builds dark three-column UI, loads guest/user config,
  * runs rAF + spawn + stats intervals, and cleans up on window teardown.

@@ -171,7 +171,7 @@ def run_server(host='localhost', port=8000):
     database.init_db()
     auth.seed_sample_users()
     server = HTTPServer((host, port), WebOSRequestHandler)
-    print(f"[⚡ SYSTEM] WebOS Backend đang chạy tại http://{host}:{port}")
+    print(f"[SYSTEM] WebOS Backend dang chay tai http://{host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
