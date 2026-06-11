@@ -83,195 +83,333 @@ Dự án giải quyết một số thách thức kỹ thuật:
 
 ---
 
-## 2. NỀN TẢNG LÝ THUYẾT
-
-### 2.1 Thuật Toán Phân Phối 
-
-#### Mục Đích
-Thuật toán LOOK là biến thể cải tiến của SCAN, trong đó thang máy chỉ tiếp tục di chuyển đến yêu cầu cuối cùng theo hướng hiện tại thay vì đi đến tầng biên của tòa nhà. Nó tối ưu hóa chuyển động thang máy bằng cách phục vụ các yêu cầu theo một hướng cho đến khi không còn yêu cầu theo hướng đó, sau đó đảo ngược.
-Mục tiêu của thuật toán LOOK là giảm tổng quãng đường di chuyển và số lần đổi hướng của thang máy, từ đó cải thiện thời gian phục vụ và tăng hiệu quả khai thác hệ thống.
-Cost-Based Elevator Dispatching là thuật toán điều phối thang máy phân bổ các yêu cầu gọi tầng dựa trên một "hàm chi phí" (cost function). Mục tiêu của hệ thống là tìm ra tổ hợp phục vụ giúp giảm thiểu tổng chi phí.
-Việc gán yêu cầu cho thang máy được thực hiện bằng hàm chi phí heuristic kết hợp nhiều yếu tố như khoảng cách, hướng di chuyển, tải trọng hiện tại, trạng thái cửa và trạng thái hoạt động của thang máy. Sau khi được gán, các tầng mục tiêu được sắp xếp theo nguyên tắc LOOK để tối ưu hóa lộ trình phục vụ.
-
-#### Đầu Vào/Đầu Ra
-- **Đầu vào:** 
-  - Vị trí và vận tốc thang máy hiện tại.
-  - Hàng đợi yêu cầu tầng (lên/xuống mỗi tầng).
-  - Trạng thái thang máy (rảnh, di chuyển, tải, lỗi).
-  - Tham số cấu hình (tải tối đa, vận tốc tối đa, tăng tốc tối đa).
-- **Đầu ra:**
-  - Thang máy được gán cho mỗi yêu cầu tầng.
-  - Danh sách tầng mục tiêu được sắp xếp cho mỗi thang máy.
-
-#### Quy Trình kết hợp thuật toán SCAN với Cost-Based Elevator Dispatching.
-```
-1. Cho mỗi yêu cầu tầng:
-   a. Tính chi phí phân phối cho mỗi thang máy
-   b. Chi phí = khoảng cách × 2 + hình phạt - thưởng
-   c. Chọn thang máy với chi phí tối thiểu
-   d. Thêm tầng vào danh sách mục tiêu của thang máy
-   e. Sắp xếp danh sách mục tiêu sử dụng thứ tự LOOK
-
-2. Sắp Xếp Mục Tiêu LOOK:
-   a. Nếu hướng = LÊN: sắp xếp tăng dần, ưu tiên tầng ≥ hiện tại
-   b. Nếu hướng = XUỐNG: sắp xếp giảm dần, ưu tiên tầng ≤ hiện tại
-   c. Sau khi phục vụ tất cả theo hướng, đảo ngược và phục vụ còn lại
-```
-
-#### Công Thức Hàm Chi Phí
-
-$$ \text{Chi Phí} = 2 \times |P_e - F_r| + P_{sai} + P_{qua\_tai} - B_{cung\_huong} + P_{loi} + P_{cua} - B_{muc\_tieu} - B_{rang} + P_{vung} $$
-
-Trong đó:
-- $P_e$: Vị trí thang máy.
-- $F_r$: Tầng được yêu cầu.
-- $P_{sai} = 8$: Hình phạt hướng sai.
-- $P_{qua\_tai} = 15 \times \text{tỷ lệ tải}$: Hình phạt quá tải.
-- $B_{cung\_huong} = 3$: Thưởng cùng hướng.
-- $P_{loi} = 100$: Hình phạt lỗi.
-- $P_{cua} = 2$: Hình phạt cửa chưa đóng.
-- $B_{muc\_tieu} = 5$: Thưởng đã có mục tiêu.
-- $B_{rang} = 2$: Thưởng rảnh.
-- $P_{vung} = 30$: Hình phạt vùng (nếu bật).
-- Các con số 8, 15, 3, 30, 100 là ước tính theo thực tế và sát thực tế nhất.
-
-#### Độ Phức Tạp Thời Gian/Không Gian
-- **Độ phức tạp thời gian:** $O(E \times F)$ cho phân phối, trong đó $E$ = thang máy, $F$ = tầng
-- **Độ phức tạp không gian:** $O(E \times F)$ để lưu trữ danh sách mục tiêu và hàng đợi
-- **Độ phức tạp sắp xếp:** $O(T \log T)$ mỗi thang máy, trong đó $T$ = số mục tiêu
-
-#### Ưu Điểm
-- Giảm tổng khoảng cách di chuyển bằng cách loại bỏ thay đổi hướng không cần thiết
-- Phân phối dịch vụ công bằng qua các tầng
-- Mẫu chuyển động có thể dự đoán
-- Dễ triển khai và debug
-
-#### Hạn Chế
-- Có thể gây đói tầng giữa trong lưu lượng cao
-- Không xem xét thời gian chờ hành khách trong tính chi phí
-- Thay đổi hướng tĩnh có thể không tối ưu cho mẫu lưu lượng động
-
-#### Lý Do Chọn
-LOOK là tiêu chuẩn công nghiệp cho phân phối thang máy do sự cân bằng giữa hiệu quả và công bằng. Nó được tài liệu hóa tốt, dễ hiểu, và cung cấp hiệu suất tốt cho mẫu lưu lượng tòa nhà điển hình.
-
-### 2.2 Mô Phỏng Vật Lý
-
-#### Mục Đích
-Mô hình mô phỏng sử dụng động học một chiều với các trạng thái tăng tốc, chạy đều và giảm tốc để xấp xỉ chuyển động thực tế của thang máy.
-
-#### Đầu Vào/Đầu Ra
-- **Đầu vào:**
-  - Tầng mục tiêu
-  - Vị trí, vận tốc, tăng tốc hiện tại
-  - Tăng tốc tối đa, vận tốc tối đa
-  - Tham số thời gian cửa
-- **Đầu ra:**
-  - Vị trí, vận tốc, tăng tốc đã cập nhật
-  - Giai đoạn hiện tại (tăng tốc, di chuyển, giảm tốc, chuỗi cửa)
-  - Trạng thái cửa (đóng, mở, mở ra, đóng lại)
-
-#### Quy Trình
-```
-1. Tính khoảng cách đến mục tiêu: d = |mục tiêu - vị trí_hiện_tại|
-
-2. Tính khoảng cách phanh: d_phanh = v² / (2a)
-
-3. Xác định giai đoạn:
-   - Nếu d < ngưỡng: GIẢM TỐC
-   - Ngược lại nếu d_phanh ≥ d: GIẢM TỐC
-   - Ngược lại nếu |v| < v_tối đa: TĂNG TỐC
-   - Ngược lại: DI CHUYỂN
-
-4. Tích hợp chuyển động:
-   - a = ±a_tối đa dựa trên giai đoạn
-   - v = v + a × dt
-   - v = clamp(v, -v_tối đa, v_tối đa)
-   - p = p + v × dt
-
-5. Xử lý dừng tầng khi p vượt qua biên tầng nguyên
-```
-
-#### Công Thức Động Học
-
-**Khoảng Cách Phanh:**
-$$ d_{phanh} = \frac{v^2}{2a} $$
-
-**Thời Gian Để Đến Khoảng Cách:**
-$$ t = \begin{cases} 
-2\sqrt{\frac{d}{a}} & \text{nếu } d \leq 2d_{tang\_toc} \\
-2t_{tang\_toc} + \frac{d - 2d_{tang\_toc}}{v_{tối\_đa}} & \text{ngược lại}
-\end{cases} $$
-
-Trong đó $d_{tang\_toc} = \frac{1}{2}at_{tang\_toc}^2$ và $t_{tang\_toc} = \frac{v_{tối\_đa}}{a}$
-
-#### Độ Phức Tạp Thời Gian/Không Gian
-- **Độ phức tạp thời gian:** $O(1)$ mỗi thang máy mỗi khung hình
-- **Độ phức tạp không gian:** $O(1)$ mỗi thang máy
-
-#### Ưu Điểm
-- Chuyển động vật lý chính xác
-- Tăng tốc/giảm tốc mượt mà
-- Hành vi dừng có thể dự đoán
-- Tham số có thể cấu hình cho các loại thang máy khác nhau
-
-#### Hạn Chế
-- Giả định thay đổi tăng tốc tức thì (giật không được mô hình hóa)
-- Không tính đến giãn cáp hoặc động học đối trọng
-- Thời gian cửa đơn giản hóa (không có cảm biến an toàn cửa)
-
-#### Lý Do Chọn
-Cung cấp mô phỏng thực tế trong khi duy trì hiệu quả tính toán. Mô hình động học đủ cho trực quan hóa và kiểm tra thuật toán phân phối.
-
-### 2.3 Phân Phối Trọng Lượng Gaussian Ngẫu Nhiên
-
-#### Mục Đích
-Tạo trọng lượng hành khách thực tế sử dụng biến đổi Box-Muller cho phân phối chuẩn.
-
-#### Công Thức
-$$ z = \sqrt{-2\ln(u_1)} \cos(2\pi u_2) $$
-$$ \text{trọng lượng} = \text{clamp}(\mu + z\sigma, \min, \max) $$
-
-Trong đó:
-- $u_1, u_2$: Số ngẫu nhiên đồng nhất trong (0, 1]
-- $\mu = 75$: Trọng lượng trung bình (kg)
-- $\sigma = 15$: Độ lệch chuẩn
-- $\min = 50$: Trọng lượng tối thiểu
-- $\max = 130$: Trọng lượng tối đa
-
-#### Ưu Điểm
-- Thực tế hơn phân phối đồng nhất
-- Phân phối chuẩn được lựa chọn như một xấp xỉ thống kê hợp lý cho cân nặng hành khách trong điều kiện thiếu dữ liệu thực nghiệm cụ thể.
-- Tham số có thể cấu hình
-- Phạm vi cập nhật (50-130kg) cho thực tế tốt hơn
-
-### 2.4 Thuật Toán phân vùng tĩnh
-
-#### Mục Đích
-Chia tầng tòa nhà thành vùng được gán cho thang máy cụ thể để giảm thời gian di chuyển trong tòa nhà cao tầng.
-
-#### Quy Trình
-```
-1. Tính kích thước vùng: kích_thước_vùng = ceil(tổng_tầng / số_thang_máy)
-
-2. Cho mỗi thang máy i:
-   - vùng_tối_thiểu = i × kích_thước_vùng
-   - vùng_tối_đa = vùng_tối_thiểu + kích_thước_vùng - 1
-
-3. Trong tính chi phí phân phối:
-   - Nếu tầng được yêu cầu ∉ [vùng_tối_thiểu, vùng_tối_đa]:
-     - Thêm hình phạt +30 vào chi phí
-```
-
-#### Ưu Điểm
-- Giảm di chuyển xuyên vùng
-- Cải thiện hiệu quả trong tòa nhà cao
-- Biên giới vùng có thể cấu hình
-
-#### Hạn Chế
-- Có thể gây mất cân bằng nếu lưu lượng không được phân phối đều
-- Yêu cầu định kích thước vùng thủ công hoặc điều chỉnh động
+# 2. NỀN TẢNG LÝ THUYẾT
 
 ---
+
+## 2.1 Mô hình Dispatcher-Scheduler
+
+### Phân tách trách nhiệm
+
+**Module 1 — Dispatcher** (`selectBestElevator`):
+- Đầu vào: một yêu cầu tầng mới
+- Đầu ra: thang máy được gán
+
+**Module 2 — LOOK Scheduler** (`sortTargetsLOOK`):
+- Đầu vào: danh sách mục tiêu hiện tại của một thang máy
+- Đầu ra: thứ tự phục vụ được sắp xếp theo LOOK
+
+Luồng xử lý:
+
+```
+Request
+  └─► Dispatcher (Cost Function + ETA)
+          └─► Elevator assigned
+                  └─► LOOK Scheduler
+                          └─► Ordered stop list
+```
+
+---
+
+### Thuật toán LOOK Scheduler
+
+LOOK là biến thể của SCAN: thang di chuyển theo một hướng, phục vụ tất cả yêu cầu đến điểm cuối cùng theo hướng đó, sau đó đảo chiều — không đi đến tầng biên nếu không có yêu cầu.
+
+**Quy trình sắp xếp:**
+
+```
+Nếu hướng = LÊN:
+    ahead  = sort_asc  { f ∈ targets | f ≥ current }
+    behind = sort_asc  { f ∈ targets | f < current }
+    result = ahead + behind
+
+Nếu hướng = XUỐNG:
+    ahead  = sort_desc { f ∈ targets | f ≤ current }
+    behind = sort_desc { f ∈ targets | f > current }
+    result = ahead + behind
+```
+
+**Độ phức tạp:**
+
+| | Độ phức tạp |
+|---|---|
+| Phân phối (Dispatcher) | $O(E \times T)$ |
+| Sắp xếp LOOK | $O(T \log T)$ mỗi thang |
+| Không gian | $O(E \times T)$ |
+
+với $E$ = số thang, $T$ = số mục tiêu hiện tại.
+
+---
+
+### Hàm Chi Phí Chuẩn Hóa với ETA
+
+#### Thay Distance bằng ETA
+
+Thay vì dùng khoảng cách tầng thuần túy, hàm chi phí sử dụng **ETA (Estimated Time of Arrival)** — thời gian ước tính thực tế để thang đến tầng yêu cầu, kể cả dừng tại các tầng trung gian:
+
+$$\text{ETA}(e, r) = t_{\text{travel}}(e \to r) + n_{\text{stops}} \cdot t_{\text{door}}$$
+
+Trong đó $n_{\text{stops}}$ là số tầng dừng trên đường đi. $t_{\text{travel}}$ được tính từ mô hình động học (xem §2.2):
+
+$$t_{\text{travel}}(d) \approx \begin{cases} 2\sqrt{\dfrac{d}{a_{max}}} & \text{nếu } d \leq \dfrac{v_{max}^2}{a_{max}} \\[8pt] \dfrac{v_{max}}{a_{max}} + \dfrac{d}{v_{max}} & \text{ngược lại} \end{cases}$$
+
+#### Chuẩn hóa thành phần chi phí
+
+Tất cả thành phần được chuẩn hóa về $[0, 1]$ trước khi kết hợp, tránh vấn đề đơn vị không đồng nhất:
+
+$$\hat{x} = \frac{x - x_{min}}{x_{max} - x_{min}}$$
+
+Trong đó $x_{min}, x_{max}$ được xác định từ giới hạn cấu hình của hệ thống.
+
+#### Hàm chi phí tổng quát
+
+$$\text{Cost}(e, r) = \sum_{i=1}^{6} w_i \cdot c_i(e, r), \quad \sum_{i=1}^{6} w_i = 1,\ w_i \geq 0$$
+
+| $i$ | Thành phần $c_i$ | Mô tả | $w_i$ mặc định |
+|---|---|---|---|
+| 1 | $\hat{\text{ETA}}$ | Thời gian ước tính đến tầng yêu cầu | 0.40 |
+| 2 | $\hat{L}$ | Tỷ lệ tải hiện tại của thang | 0.20 |
+| 3 | $\hat{Z}$ | Khoảng cách ngoài vùng (Soft Zone) | 0.15 |
+| 4 | $\hat{S}$ | Hướng không phù hợp với yêu cầu | 0.15 |
+| 5 | $-\hat{B}_{wait}$ | Thưởng yêu cầu đã chờ lâu (trừ vào cost) | 0.05 |
+| 6 | $-\hat{B}_{traffic}$ | Thưởng phù hợp với chế độ lưu lượng | 0.05 |
+
+Trọng số $w_i$ được điều chỉnh thực nghiệm thông qua thử nghiệm nhiều cấu hình khác nhau nhằm đạt cân bằng giữa thời gian chờ và mức sử dụng thang máy.
+
+#### Soft Zone
+
+Thay vì phạt nhị phân (trong/ngoài vùng), penalty vùng tỷ lệ với mức độ vi phạm:
+
+$$Z(e, r) = \frac{\max\!\bigl(0,\ |F_r - c_e| - R_e\bigr)}{F_{total}}$$
+
+Trong đó $c_e$ là trung tâm vùng của thang (tính từ phân vùng tĩnh hoặc động), $R_e$ là nửa kích thước vùng. Kết quả đã nằm trong $[0, 1]$ nên không cần chuẩn hóa thêm.
+
+#### Wait Bonus — Aging (Chống Starvation)
+
+$$B_{wait}(r) = \min\!\left(k \cdot t_{wait}(r),\ B_{max}\right)$$
+
+Trong đó $t_{wait}(r)$ là thời gian yêu cầu $r$ đã chờ. $B_{max} = 1$ (sau chuẩn hóa) giới hạn trên để tránh bonus vô hạn chi phối toàn bộ hàm chi phí.
+
+---
+
+## 2.2 Mô Phỏng Vật Lý
+
+### Tích phân Semi-Implicit Euler
+
+Thay vì Euler tường minh:
+
+```
+// Euler tường minh — kém ổn định
+p += v * dt
+v += a * dt
+```
+
+Dùng **Semi-Implicit Euler** (cập nhật vận tốc trước, dùng vận tốc mới để cập nhật vị trí):
+
+$$v_{n+1} = v_n + a_n \cdot \Delta t$$
+$$p_{n+1} = p_n + v_{n+1} \cdot \Delta t$$
+
+Sai số tích lũy giảm và hệ thống có ổn định số tốt hơn, giảm sai số tích lũy trong mô phỏng thời gian thực.
+
+---
+
+### Mô hình Jerk (Giới hạn thay đổi gia tốc)
+
+Mô hình trước thay đổi gia tốc tức thời ($a \leftarrow \pm a_{max}$), không phản ánh thực tế. Thêm **jerk** $j = da/dt$ như biến trạng thái thứ ba:
+
+$$a_{n+1} = \text{clamp}\!\left(a_n + j_{\text{cmd}} \cdot \Delta t,\ -a_{max},\ a_{max}\right)$$
+$$v_{n+1} = \text{clamp}\!\left(v_n + a_{n+1} \cdot \Delta t,\ -v_{max},\ v_{max}\right)$$
+$$p_{n+1} = p_n + v_{n+1} \cdot \Delta t$$
+
+**Biên dạng jerk theo giai đoạn chuyển động:**
+
+| Giai đoạn | $j_{\text{cmd}}$ |
+|---|---|
+| Bắt đầu tăng tốc | $+j_{max}$ |
+| Tăng tốc đều (a = $a_{max}$) | $0$ |
+| Kết thúc tăng tốc | $-j_{max}$ |
+| Bắt đầu giảm tốc | $-j_{max}$ |
+| Giảm tốc đều (a = $-a_{max}$) | $0$ |
+| Kết thúc giảm tốc | $+j_{max}$ |
+
+**Khoảng cách phanh** với jerk:
+
+$$d_{brake} \approx \frac{v^2}{2a_{max}} + \frac{v \cdot a_{max}}{2 j_{max}}$$
+
+Đây là công thức gần đúng. Số hạng thứ hai là phần bổ sung do thời gian chuyển tiếp jerk. Điều kiện kích hoạt phanh cần dùng công thức này thay cho công thức đơn giản $v^2/(2a)$.
+
+**Thời gian di chuyển** (công thức giải tích thay cho tích phân từng frame khi cần ước tính ETA):
+
+$$t(d) \approx \begin{cases} 2\sqrt{\dfrac{d}{a_{max}}} & \text{nếu } d \leq \dfrac{v_{max}^2}{a_{max}} \\[8pt] \dfrac{v_{max}}{a_{max}} + \dfrac{d}{v_{max}} & \text{ngược lại} \end{cases}$$
+
+Đây là công thức xấp xỉ dùng trong Dispatcher để tính ETA mà không cần chạy mô phỏng.
+
+**Độ phức tạp:** $O(1)$ thời gian và không gian mỗi thang mỗi frame.
+
+---
+
+## 2.3 Phân Phối Trọng Lượng Gaussian Cắt Cụt
+
+### Vấn đề với clamp
+
+Khi lấy mẫu Gaussian rồi `clamp` vào $[w_{min}, w_{max}]$, xác suất tại hai đầu biên tăng đột biến thành khối điểm — không còn là phân phối Gaussian. Dùng **rejection sampling** để giữ đúng phân phối:
+
+```
+repeat:
+    u1, u2 ~ Uniform(0, 1]
+    z = sqrt(-2 · ln(u1)) · cos(2π · u2)    // Box-Muller
+    w = μ + z · σ
+until w ∈ [w_min, w_max]
+return w
+```
+
+Phân phối kết quả là Gaussian điều kiện — **Truncated Gaussian**:
+
+$$f(w) = \frac{\phi\!\left(\frac{w - \mu}{\sigma}\right)}{\sigma \left[\Phi\!\left(\frac{w_{max} - \mu}{\sigma}\right) - \Phi\!\left(\frac{w_{min} - \mu}{\sigma}\right)\right]}, \quad w \in [w_{min}, w_{max}]$$
+
+Trong đó $\phi$ là PDF và $\Phi$ là CDF của phân phối chuẩn tắc $\mathcal{N}(0,1)$.
+
+**Số lần lặp trung bình** của rejection sampling với các tham số dưới đây là $\approx 1.1$ (vì phần bị cắt rất nhỏ), không ảnh hưởng đáng kể đến hiệu năng.
+
+### Tham số
+
+| Tham số | Giá trị mặc định | Ghi chú |
+|---|---|---|
+| $\mu$ | $70\ \text{kg}$ | Có thể hiệu chỉnh theo nhân khẩu học |
+| $\sigma$ | $12\ \text{kg}$ | Có thể hiệu chỉnh |
+| $w_{min}$ | $50\ \text{kg}$ | |
+| $w_{max}$ | $130\ \text{kg}$ | |
+
+---
+
+## 2.4 Adaptive Scheduling
+
+Thay vì dùng trọng số cố định, hệ thống điều chỉnh $w_i$ và hành vi điều phối theo trạng thái vận hành hiện tại. Không thay đổi cấu trúc LOOK hay Cost Function — chỉ điều chỉnh tham số.
+
+### Hệ số tải (Load Factor)
+
+$$\Lambda = \frac{N_{pending}}{E}$$
+
+Trong đó $N_{pending}$ là số yêu cầu đang chờ, $E$ là số thang.
+
+Trọng số được điều chỉnh mượt theo $\Lambda$ qua hàm sigmoid, tránh ngưỡng cứng (if/else):
+
+$$w_i(\Lambda) = w_i^{(0)} + \Delta w_i \cdot \sigma\!\bigl(\beta(\Lambda - \Lambda_0)\bigr)$$
+
+$$\sigma(x) = \frac{1}{1 + e^{-x}}$$
+
+Trong đó $\Lambda_0$ là ngưỡng tải trung tâm, $\beta$ kiểm soát độ dốc chuyển tiếp. Các tham số này được lựa chọn thực nghiệm.
+
+Ví dụ điều chỉnh điển hình:
+
+| Trọng số | $\Lambda$ thấp | $\Lambda$ cao |
+|---|---|---|
+| $w_1$ (ETA) | 0.50 | 0.30 |
+| $w_3$ (Zone) | 0.10 | 0.25 |
+| $w_4$ (Direction) | 0.10 | 0.20 |
+
+### Phát hiện lưu lượng (Traffic Detection)
+
+Hệ thống theo dõi tỷ lệ yêu cầu trong cửa sổ thời gian trượt $[t - T_w, t]$ (chỉ xét hall-call):
+
+$$r_{up}(t) = \frac{N_{up}}{N_{up} + N_{down}}, \quad r_{down}(t) = 1 - r_{up}(t)$$
+
+Ba chế độ vận hành:
+
+| Chế độ | Điều kiện | Điều chỉnh |
+|---|---|---|
+| **UP PEAK** | $r_{up} > \theta_u$ | Giảm $w_4$ cho hướng lên; tăng $w_6$ |
+| **DOWN PEAK** | $r_{down} > \theta_d$ | Tương tự cho hướng xuống |
+| **NORMAL** | Còn lại | Trọng số cân bằng mặc định |
+
+$\theta_u, \theta_d$ là ngưỡng cấu hình (giá trị khởi đầu: 0.70).
+
+### Định vị thang rảnh (Idle Positioning)
+
+Khi thang rảnh trong $T_{idle}$ giây, thang di chuyển về tầng có xác suất gọi cao nhất:
+
+$$f^* = \arg\max_{f \in [1, F]} \hat{\lambda}_f$$
+
+Trong đó $\hat{\lambda}_f$ là tần suất yêu cầu ước tính tại tầng $f$, tính bằng cửa sổ trượt có trọng số hàm mũ:
+
+$$\hat{\lambda}_f(t) = (1 - \alpha)\,\hat{\lambda}_f(t - \Delta t) + \alpha \cdot \mathbb{1}[\text{request at } f \text{ in } \Delta t]$$
+
+$\alpha \in (0, 1)$ là hệ số làm mượt (decay rate).
+
+### Hàm chi phí đầy đủ sau Adaptive Scheduling
+
+$$\boxed{\text{Cost}(e, r) = w_1(\Lambda)\cdot\hat{\text{ETA}} + w_2(\Lambda)\cdot\hat{L} + w_3(\Lambda)\cdot\hat{Z} + w_4(\Lambda)\cdot\hat{S} - w_5\cdot\hat{B}_{wait} - w_6(\text{mode})\cdot\hat{B}_{traffic}}$$
+
+---
+
+## 2.5 Phân Vùng Động (Dynamic Zoning)
+
+### Hạn chế của phân vùng tĩnh
+
+Phân vùng đều theo tầng giả định lưu lượng đồng nhất. Khi lưu lượng lệch (ví dụ: tầng thấp đông hơn), một thang bị quá tải trong khi thang khác rảnh.
+
+### Phân vùng theo lưu lượng
+
+Mỗi $T_{rebalance}$ giây, hệ thống cập nhật biên giới vùng dựa trên $\hat{\lambda}_f$.
+
+**Mục tiêu:** Chia $F$ tầng thành $E$ vùng sao cho tổng lưu lượng ước tính mỗi vùng xấp xỉ bằng nhau:
+
+$$\sum_{f \in \text{zone}_i} \hat{\lambda}_f \approx \frac{1}{E} \sum_{f=1}^{F} \hat{\lambda}_f \quad \forall\, i = 1, \ldots, E$$
+
+**Thuật toán:**
+
+```
+1. Tính tích lũy lưu lượng:
+       C[f] = Σ λ̂_k,  k = 1..f
+
+2. Ngưỡng lưu lượng mỗi vùng:
+       τ_i = (i / E) · C[F],   i = 1..E
+
+3. Tìm biên vùng:
+       boundary_i = min { f : C[f] ≥ τ_i }
+
+4. Cập nhật zone_min[i], zone_max[i] cho mỗi thang
+```
+
+**Độ phức tạp:** $O(F)$ mỗi lần cập nhật, chạy định kỳ không ảnh hưởng đến hiệu năng real-time.
+
+### So sánh phân vùng tĩnh và động
+
+| | Tĩnh | Động |
+|---|---|---|
+| Biên giới vùng | Cố định | Cập nhật mỗi $T_{rebalance}$ |
+| Giả định | Lưu lượng đồng nhất | Không yêu cầu |
+| Tham số thêm | Không | $T_{rebalance}$, $\alpha$ (decay) |
+| Triển khai | Đơn giản | Trung bình |
+| Hiệu quả khi lưu lượng lệch | Thấp | Cao hơn |
+
+Cơ chế Soft Zone (§2.1) vẫn giữ nguyên — biên giới động chỉ dịch chuyển tâm và bán kính vùng, không thay đổi cách tính penalty.
+
+### Hysteresis (Chống Zone Thrashing)
+
+Để tránh biên giới vùng nhảy liên tục (zone thrashing), hệ thống chỉ cập nhật vùng khi sự thay đổi biên giới vượt ngưỡng:
+
+$$|\Delta \text{boundary}| > 2 \quad \text{hoặc} \quad \Delta \text{Load} > 15\%$$
+
+Điều này đảm bảo tính ổn định của phân vùng.
+
+---
+
+### Giới hạn mô hình
+
+Mô phỏng hiện tại có các giới hạn sau:
+
+- Không mô phỏng đối trọng (counterweight)
+- Không mô phỏng động cơ điện và hệ thống điều khiển động cơ
+- Không mô phỏng cáp kéo và ma sát
+- ETA là giá trị xấp xỉ, không tính chính xác tất cả các yếu tố thực tế
+- Adaptive Scheduling dựa trên heuristic, không sử dụng machine learning
+- Mô hình Jerk chưa triển khai đầy đủ S-Curve Motion Profile 7 pha chuẩn công nghiệp
+- Phát hiện lưu lượng chỉ xét hall-call, không bao gồm yêu cầu nội bộ cabin
+- Dynamic Zoning chưa triển khai đầy đủ cơ chế hysteresis trong code
+
+---
+
 
 ## 3. CÔNG NGHỆ SỬ DỤNG
 

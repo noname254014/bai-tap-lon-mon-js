@@ -270,9 +270,6 @@ export function minimizeWindow(windowId) {
     });
 }
 
-// =========================================================================
-// CHỈNH SỬA CỐT LÕI TẠI ĐÂY: Trả lại thuộc tính hiển thị 'flex' thay vì 'block'
-// =========================================================================
 export function restoreWindow(windowId) {
     const el = document.getElementById(windowId);
     const winData = openWindows.get(windowId);
