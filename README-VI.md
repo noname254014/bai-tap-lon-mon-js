@@ -168,7 +168,7 @@ Sau khi đăng nhập thành công, hệ thống sẽ tải giao diện Web OS.
 * Nếu backend không chạy, các chức năng đăng nhập và lưu dữ liệu sẽ không hoạt động.
 * SQLite sẽ tự tạo cơ sở dữ liệu khi chạy lần đầu.
 * Nên sử dụng Google Chrome hoặc Microsoft Edge để có hiệu năng mô phỏng tốt nhất.
-
+* Có thể đổi nền bằng cách cho vào thư mục với tên temp, ví dụ nếu đổi thư mục temp thành tên khác, đổi thư mục a thành temp là đổi nền
 ---
 
 ## Tài khoản mẫu
